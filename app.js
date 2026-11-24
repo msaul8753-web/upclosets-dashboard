@@ -126,6 +126,7 @@ const PAGES = [
   { id: "leads", label: "Leads", ico: "✦", count: () => D.leads.filter((l) => /^new$/i.test(l.status)).length },
   { id: "jobs", label: "Jobs", ico: "⚒", count: () => D.jobs.filter((j) => !/done|cancel/i.test(j.status)).length },
   { id: "clients", label: "Clients", ico: "☷" },
+  { id: "marketing", label: "Marketing", ico: "📣" },
   { g: "Money" },
   { id: "estimates", label: "Estimates", ico: "✎" },
   { id: "invoices", label: "Invoices", ico: "▤" },
@@ -181,7 +182,7 @@ function tabs(key, items, onPick) {
 }
 
 // ---------- charts ----------
-function barChart(points, { h = 190, color = "var(--orange)" } = {}) {
+function barChart(points, { h = 190, color = "var(--orange)", count = false } = {}) {
   const w = 640, pad = { l: 46, r: 8, t: 10, b: 24 };
   const max = Math.max(1, ...points.map((p) => p.v));
   const step = (w - pad.l - pad.r) / Math.max(points.length, 1);
@@ -190,8 +191,8 @@ function barChart(points, { h = 190, color = "var(--orange)" } = {}) {
   const ticks = [0, 0.5, 1].map((f) => max * f);
   const every = Math.ceil(points.length / 8);
   return `<svg class="chart" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
-    ${ticks.map((t) => `<line x1="${pad.l}" x2="${w - pad.r}" y1="${y(t)}" y2="${y(t)}" stroke="#26262d"/><text x="${pad.l - 6}" y="${y(t) + 3}" text-anchor="end">${t >= 1000 ? "$" + Math.round(t / 1000) + "k" : "$" + Math.round(t)}</text>`).join("")}
-    ${points.map((p, i) => { const x = pad.l + i * step + (step - bw) / 2; return `<rect x="${x}" y="${y(p.v)}" width="${bw}" height="${Math.max(0, h - pad.b - y(p.v))}" rx="3" fill="${color}"><title>${esc(p.label)}: ${money(p.v)}</title></rect>${i % every === 0 ? `<text x="${x + bw / 2}" y="${h - 8}" text-anchor="middle">${esc(p.short ?? p.label)}</text>` : ""}`; }).join("")}
+    ${ticks.map((t) => `<line x1="${pad.l}" x2="${w - pad.r}" y1="${y(t)}" y2="${y(t)}" stroke="#26262d"/><text x="${pad.l - 6}" y="${y(t) + 3}" text-anchor="end">${count ? Math.round(t) : t >= 1000 ? "$" + Math.round(t / 1000) + "k" : "$" + Math.round(t)}</text>`).join("")}
+    ${points.map((p, i) => { const x = pad.l + i * step + (step - bw) / 2; return `<rect x="${x}" y="${y(p.v)}" width="${bw}" height="${Math.max(0, h - pad.b - y(p.v))}" rx="3" fill="${color}"><title>${esc(p.label)}: ${count ? p.v : money(p.v)}</title></rect>${i % every === 0 ? `<text x="${x + bw / 2}" y="${h - 8}" text-anchor="middle">${esc(p.short ?? p.label)}</text>` : ""}`; }).join("")}
   </svg>`;
 }
 const PALETTE = ["#f28c28", "#8b5cf6", "#3fcf8e", "#5aa9ff", "#f5c542", "#f26464", "#ffa64d", "#a78bfa"];
@@ -224,6 +225,7 @@ function salesSeries(range) {
 // ---------- views ----------
 const VIEWS = {};
 VIEWS.todo = viewTodo;
+VIEWS.marketing = () => viewMarketing();
 const view = (html) => { $("#view").innerHTML = html; };
 
 VIEWS.home = () => {
@@ -1041,3 +1043,187 @@ window.addEventListener("hashchange", () => D.user && route());
 
 sb.auth.getSession().then(({ data }) => start(data.session));
 sb.auth.onAuthStateChange((evt, session) => { if (evt === "SIGNED_OUT") start(null); });
+
+// ---------- marketing ----------
+const BOOKING_URL = "https://online-booking.workiz.com/?ac=69b0655abea585780d5fb50433b1ee519c29308a27fddb6f20470eff1f241a6e";
+const WEBSITE_URL = "https://upclosets.com/rhode-island/";
+function channelOf(src) {
+  const s = String(src || "").trim();
+  if (!s) return "Unknown (no source)";
+  if (/facebook|instagram|\bfb\b|\big\b|meta/i.test(s)) return "Facebook / Instagram";
+  if (/lsa|local services/i.test(s)) return "Google LSA";
+  if (/google/i.test(s)) return "Google";
+  if (/serv/i.test(s)) return "Serv";
+  if (/word|referr|partner|realtor/i.test(s)) return "Referral / word of mouth";
+  if (/home ?show/i.test(s)) return "Home show";
+  if (/yard|door|nextdoor|neighbor/i.test(s)) return "Yard signs / neighborhood";
+  if (/website|online booking|web/i.test(s)) return "Website / online booking";
+  if (/home ?advisor|angi/i.test(s)) return "HomeAdvisor / Angi";
+  return s;
+}
+const MK = { tab: "overview", period: "year" };
+
+async function viewMarketing() {
+  view(`<div class="empty">Loading marketing…</div>`);
+  const [{ data: spend, error: e1 }, { data: camps, error: e2 }] = await Promise.all([
+    sb.from("marketing_spend").select("*").order("month", { ascending: false }),
+    sb.from("campaigns").select("*").order("sort").order("id"),
+  ]);
+  if (e1 || e2) return view(`<div class="notice">${esc((e1 || e2).message)}</div>`);
+  const tabsHtml = [["overview", "Results"], ["campaigns", "Campaigns"], ["spend", "Ad spend"], ["links", "Links & tracking"]]
+    .map(([id, l]) => `<div class="tab ${MK.tab === id ? "active" : ""}" data-mk="${id}" style="min-width:120px;text-align:left"><div class="t">${l}</div></div>`).join("");
+  const head = `<div class="page-head"><h2>Marketing</h2><div class="spacer"></div><button class="btn primary" id="mk-new-lead">＋ New lead</button></div><div class="tabs">${tabsHtml}</div>`;
+  const body = { overview: mkOverview, campaigns: mkCampaigns, spend: mkSpend, links: mkLinks }[MK.tab](spend, camps);
+  view(head + body.html);
+  $$("[data-mk]").forEach((t) => t.onclick = () => { MK.tab = t.dataset.mk; viewMarketing(); });
+  $("#mk-new-lead").onclick = openNewLead;
+  body.mount?.();
+}
+
+function mkPeriodStart() {
+  const t = startOfDay();
+  return { month: new Date(t.getFullYear(), t.getMonth(), 1), "90d": addDays(t, -90), year: new Date(t.getFullYear(), 0, 1), all: new Date(2000, 0, 1) }[MK.period];
+}
+
+function mkOverview(spend) {
+  const since = mkPeriodStart();
+  const leads = D.leads.filter((l) => toDate(l.created_local) >= since);
+  const estByLead = new Map(); D.estimates.forEach((e) => { if (!estByLead.has(e.job_id)) estByLead.set(e.job_id, []); estByLead.get(e.job_id).push(e); });
+  const rows = new Map();
+  const bump = (key, sub, l) => {
+    if (!rows.has(key)) rows.set(key, { channel: key, subs: new Map(), leads: 0, consults: 0, estimates: 0, won: 0, wonValue: 0, spend: 0 });
+    const r = rows.get(key);
+    const targets = [r]; if (sub && sub !== key) { if (!r.subs.has(sub)) r.subs.set(sub, { channel: sub, leads: 0, consults: 0, estimates: 0, won: 0, wonValue: 0, spend: 0 }); targets.push(r.subs.get(sub)); }
+    const es = estByLead.get(l.workiz_id) || [];
+    const wonE = es.filter((e) => /won|approved/i.test(e.status));
+    const isWon = wonE.length > 0 || /sold/i.test(l.status || "");
+    targets.forEach((t) => { t.leads++; if (l.start_local) t.consults++; if (es.length) t.estimates++; if (isWon) { t.won++; t.wonValue += Math.max(0, ...wonE.map((e) => num(e.total))); } });
+  };
+  leads.forEach((l) => bump(channelOf(l.source), l.source, l));
+  spend.filter((s) => toDate(s.month + " 00:00:00") >= new Date(since.getFullYear(), since.getMonth(), 1)).forEach((s) => {
+    const key = channelOf(s.channel);
+    if (!rows.has(key)) rows.set(key, { channel: key, subs: new Map(), leads: 0, consults: 0, estimates: 0, won: 0, wonValue: 0, spend: 0 });
+    const r = rows.get(key); r.spend += num(s.amount);
+    if (s.channel !== key) { if (!r.subs.has(s.channel)) r.subs.set(s.channel, { channel: s.channel, leads: 0, consults: 0, estimates: 0, won: 0, wonValue: 0, spend: 0 }); r.subs.get(s.channel).spend += num(s.amount); }
+  });
+  const list = [...rows.values()].sort((a, b) => b.leads - a.leads);
+  const tot = list.reduce((t, r) => ({ leads: t.leads + r.leads, est: t.est + r.estimates, won: t.won + r.won, val: t.val + r.wonValue, spend: t.spend + r.spend }), { leads: 0, est: 0, won: 0, val: 0, spend: 0 });
+  const pct = (a, b) => (b ? Math.round((a / b) * 100) + "%" : "—");
+  const per = (a, b) => (b ? money0(a / b) : "—");
+  const line = (r, sub = false) => `<tr ${sub ? 'style="color:var(--muted)"' : ""}><td>${sub ? "&nbsp;&nbsp;↳ " : "<b>"}${esc(r.channel)}${sub ? "" : "</b>"}</td>
+    <td class="right num">${r.leads}</td><td class="right num">${r.consults}</td><td class="right num">${r.estimates}</td><td class="right num">${r.won}</td>
+    <td class="right num">${pct(r.won, r.leads)}</td><td class="right num">${money0(r.wonValue)}</td><td class="right num">${r.spend ? money0(r.spend) : "—"}</td>
+    <td class="right num">${r.spend ? per(r.spend, r.leads) : "—"}</td><td class="right num">${r.spend ? per(r.spend, r.won) : "—"}</td>
+    <td class="right num">${r.spend ? (r.wonValue / r.spend).toFixed(1) + "×" : "—"}</td></tr>`;
+  const months = Array.from({ length: 12 }, (_, i) => { const t = startOfDay(); const m = new Date(t.getFullYear(), t.getMonth() - 11 + i, 1);
+    const v = D.leads.filter((l) => { const d = toDate(l.created_local); return d && d.getFullYear() === m.getFullYear() && d.getMonth() === m.getMonth(); }).length;
+    return { label: m.toLocaleDateString("en-US", { month: "long", year: "numeric" }), short: m.toLocaleDateString("en-US", { month: "short" }), v }; });
+  const unknown = leads.filter((l) => !l.source).length;
+  return { html: `
+    <div style="display:flex;gap:10px;align-items:center;margin-bottom:14px"><span class="muted small">Period</span>
+      <select class="pill-select" id="mk-period">${[["month", "This month"], ["90d", "Last 90 days"], ["year", "This year"], ["all", "All time"]].map(([v, l]) => `<option value="${v}" ${MK.period === v ? "selected" : ""}>${l}</option>`).join("")}</select></div>
+    <div class="grid g4">
+      <div class="card kpi"><span class="label">Leads</span><span class="value num">${tot.leads}</span><span class="sub">${unknown} with no source tagged</span></div>
+      <div class="card kpi purple"><span class="label">Estimates sent</span><span class="value num">${tot.est}</span><span class="sub">${pct(tot.est, tot.leads)} of leads</span></div>
+      <div class="card kpi green"><span class="label">Sold</span><span class="value num">${tot.won}</span><span class="sub">${pct(tot.won, tot.leads)} close rate · ${money0(tot.val)}</span></div>
+      <div class="card kpi"><span class="label">Ad spend</span><span class="value num">${tot.spend ? money0(tot.spend) : "—"}</span><span class="sub">${tot.spend ? `${per(tot.spend, tot.leads)} per lead · ${(tot.val / tot.spend).toFixed(1)}× return` : "enter it on the Ad spend tab"}</span></div>
+    </div>
+    <div class="card" style="margin-top:16px"><div class="card-h"><h3>Results by channel</h3><span class="muted small">lead source from Workiz · sold = won/approved estimate or "Sold" status · value = won estimate amount</span></div>
+      <div class="table-wrap"><table><thead><tr><th>Channel</th><th class="right">Leads</th><th class="right">Consults booked</th><th class="right">Estimates</th><th class="right">Sold</th><th class="right">Close rate</th><th class="right">Sold value</th><th class="right">Spend</th><th class="right">Cost / lead</th><th class="right">Cost / sale</th><th class="right">Return</th></tr></thead>
+      <tbody>${list.map((r) => line(r) + [...r.subs.values()].sort((a, b) => b.leads - a.leads).map((s) => line(s, true)).join("")).join("") || `<tr><td colspan="11"><div class="empty">No leads in this period</div></td></tr>`}</tbody></table></div></div>
+    <div class="grid g3" style="margin-top:16px">
+      <div class="card span2"><div class="card-h"><h3>New leads per month</h3></div><div class="card-b">${barChart(months, { color: "var(--purple)", count: true })}</div></div>
+      <div class="card"><div class="card-h"><h3>Leads by channel</h3></div><div class="card-b">${donut(list.filter((r) => r.leads).slice(0, 6).map((r) => ({ label: r.channel, v: r.leads })))}</div></div>
+    </div>
+    ${unknown ? `<div class="notice" style="margin-top:16px"><b>${unknown} leads in this period have no source.</b> Set the ad group on each new lead in Workiz (Facebook, Google, Referral…) so every lead counts toward the right channel.</div>` : ""}`,
+    mount() { $("#mk-period").onchange = (e) => { MK.period = e.target.value; viewMarketing(); }; } };
+}
+
+function utmLink(c, base = BOOKING_URL) {
+  const src = /google/i.test(c.channel) ? "google" : /facebook|instagram/i.test(c.channel) ? "facebook" : /nextdoor|door|yard/i.test(c.channel) ? "offline" : c.channel.toLowerCase().replace(/[^a-z]+/g, "_");
+  const med = /google ads/i.test(c.channel) ? "cpc" : /facebook|instagram/i.test(c.channel) ? "paid_social" : /referral|partner/i.test(c.channel) ? "referral" : "offline";
+  return `${base}${base.includes("?") ? "&" : "?"}utm_source=${src}&utm_medium=${med}&utm_campaign=${encodeURIComponent(c.utm_campaign || "campaign")}`;
+}
+
+function mkCampaigns(_, camps) {
+  const STAT = ["idea", "ready", "running", "paused", "done"];
+  return { html: `
+    <div class="notice" style="margin-bottom:14px">Ready-to-run campaigns for a closet business. Each card has the audience, budget, ad copy you can paste, step-by-step setup, and a tracking link. Set the status as you launch them, and keep notes on what worked.</div>
+    <div class="grid g2">${camps.map((c) => `<div class="card"><div class="card-h"><h3>${esc(c.name)}</h3><div class="spacer"></div>
+        <select class="pill-select" data-cst="${c.id}">${STAT.map((s) => `<option ${s === c.status ? "selected" : ""}>${s}</option>`).join("")}</select></div>
+      <div class="card-b" style="display:flex;flex-direction:column;gap:10px">
+        <div><span class="badge b-orange">${esc(c.channel)}</span>${c.objective ? ` <span class="muted small">${esc(c.objective)}</span>` : ""}</div>
+        ${c.audience ? `<div class="small"><b>Audience:</b> <span class="muted">${esc(c.audience)}</span></div>` : ""}
+        ${c.budget ? `<div class="small"><b>Budget:</b> <span class="muted">${esc(c.budget)}</span></div>` : ""}
+        ${c.headline || c.primary_text ? `<div class="note">${c.headline ? `<b>${esc(c.headline)}</b><br>` : ""}${esc(c.primary_text || "")}${c.cta ? `<div class="muted small" style="margin-top:6px">Button: ${esc(c.cta)}</div>` : ""}</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">${c.headline ? `<button class="btn small" data-cp="${esc(c.headline)}">⧉ Copy headline</button>` : ""}${c.primary_text ? `<button class="btn small" data-cpid="${c.id}">⧉ Copy ad text</button>` : ""}</div>` : ""}
+        ${c.how_to ? `<details><summary style="cursor:pointer;color:var(--purple-2);font-size:13px">How to set it up</summary><div class="muted small" style="white-space:pre-wrap;margin-top:6px">${esc(c.how_to)}</div></details>` : ""}
+        <div class="small"><b>Tracking link</b> (booking page): <input readonly value="${esc(utmLink(c))}" style="font-size:11.5px;margin-top:4px" /></div>
+        <div style="display:flex;gap:8px"><button class="btn small" data-cp="${esc(utmLink(c))}">⧉ Copy link</button><button class="btn small" data-cp="${esc(utmLink(c, WEBSITE_URL))}">⧉ Website version</button></div>
+        <textarea data-cnote="${c.id}" rows="2" placeholder="Notes: results, what worked, dates…">${esc(c.notes || "")}</textarea>
+      </div></div>`).join("")}</div>
+    <div class="card" style="margin-top:16px"><div class="card-h"><h3>Add your own campaign</h3></div><div class="card-b"><div class="form-row">
+      <label class="wide">Name<input id="nc-name" /></label><label>Channel<input id="nc-ch" placeholder="Facebook / Instagram" /></label><button class="btn primary" id="nc-add">＋ Add</button></div></div></div>`,
+    mount() {
+      const copy = async (t) => { try { await navigator.clipboard.writeText(t); toast("Copied"); } catch { toast("Copy blocked. Select the text instead.", true); } };
+      $$("[data-cp]").forEach((b) => b.onclick = () => copy(b.dataset.cp));
+      $$("[data-cpid]").forEach((b) => b.onclick = () => copy(camps.find((c) => String(c.id) === b.dataset.cpid).primary_text));
+      $$("[data-cst]").forEach((s) => s.onchange = async () => { const { error } = await sb.from("campaigns").update({ status: s.value }).eq("id", s.dataset.cst); error ? toast(error.message, true) : toast("Status saved"); });
+      $$("[data-cnote]").forEach((t) => t.onchange = async () => { const { error } = await sb.from("campaigns").update({ notes: t.value }).eq("id", t.dataset.cnote); error ? toast(error.message, true) : toast("Note saved"); });
+      $("#nc-add").onclick = async () => { const name = $("#nc-name").value.trim(); if (!name) return; const { error } = await sb.from("campaigns").insert({ name, channel: $("#nc-ch").value.trim() || "Other", sort: 999, utm_campaign: name.toLowerCase().replace(/[^a-z0-9]+/g, "_") }); error ? toast(error.message, true) : viewMarketing(); };
+    } };
+}
+
+function mkSpend(spend) {
+  const sources = [...new Set([...D.leads.map((l) => l.source).filter(Boolean), "Google Ads", "Google LSA", "Nextdoor", "Door hangers / yard signs", "Home show booth", "Referral rewards"])].sort();
+  const thisMonth = dayKey(new Date(new Date().getFullYear(), new Date().getMonth(), 1)).slice(0, 7);
+  return { html: `
+    <div class="notice" style="margin-bottom:14px">Enter what you spent per channel each month (ad platform totals, agency/setter fees, sign printing, home show booth). The Results tab then shows cost per lead, cost per sale and return. Spend can be pulled in automatically if you connect an ad-data connector (Adspirer or Windsor.ai).</div>
+    <div class="card"><div class="card-b"><div class="form-row">
+      <label>Month<input id="sp-month" type="month" value="${thisMonth}" /></label>
+      <label class="wide">Channel / source<input id="sp-ch" list="sp-list" placeholder="e.g. Facebook - Lakyn" /></label>
+      <datalist id="sp-list">${sources.map((s) => `<option value="${esc(s)}">`).join("")}</datalist>
+      <label>Amount ($)<input id="sp-amt" type="number" min="0" step="1" /></label></div>
+      <div style="margin-top:10px"><button class="btn primary" id="sp-add">Save spend</button> <span class="muted small">Saving the same month and channel again replaces it.</span></div></div></div>
+    <div class="card" style="margin-top:16px"><div class="table-wrap"><table><thead><tr><th>Month</th><th>Channel</th><th>Counts toward</th><th class="right">Amount</th><th></th></tr></thead><tbody>
+      ${spend.map((s) => `<tr><td>${esc(toDate(s.month + " 00:00:00").toLocaleDateString("en-US", { month: "long", year: "numeric" }))}</td><td>${esc(s.channel)}</td><td class="muted">${esc(channelOf(s.channel))}</td><td class="right num">${money(s.amount)}</td><td class="right"><button class="btn small danger" data-spdel="${s.id}">Remove</button></td></tr>`).join("") || `<tr><td colspan="5"><div class="empty">No spend entered yet</div></td></tr>`}
+    </tbody></table></div></div>`,
+    mount() {
+      $("#sp-add").onclick = async () => {
+        const m = $("#sp-month").value, ch = $("#sp-ch").value.trim(), amt = num($("#sp-amt").value);
+        if (!m || !ch) return toast("Pick a month and channel", true);
+        const { error } = await sb.from("marketing_spend").upsert({ month: m + "-01", channel: ch, amount: amt }, { onConflict: "month,channel" });
+        error ? toast(error.message, true) : (toast("Saved"), viewMarketing());
+      };
+      $$("[data-spdel]").forEach((b) => b.onclick = async () => { const { error } = await sb.from("marketing_spend").delete().eq("id", b.dataset.spdel); error ? toast(error.message, true) : viewMarketing(); });
+    } };
+}
+
+function mkLinks() {
+  const L = [
+    ["Meta Ads Manager", "https://adsmanager.facebook.com/", "Create and manage Facebook/Instagram ads"],
+    ["Meta Business Suite", "https://business.facebook.com/", "Posts, inbox, lead forms, Instagram"],
+    ["Meta Events Manager (Pixel)", "https://business.facebook.com/events_manager2/", "Website tracking for retargeting"],
+    ["Google Ads", "https://ads.google.com/", "Search ads"],
+    ["Google Local Services Ads", "https://ads.google.com/local-services-ads/", "Pay-per-lead, Google Guaranteed"],
+    ["Google Business Profile", "https://business.google.com/", "Maps listing, posts, reviews"],
+    ["Nextdoor for Business", "https://business.nextdoor.com/", "Neighborhood ads and posts"],
+    ["GoHighLevel", "https://app.gohighlevel.com/", "Your booking calendar and lead follow-up"],
+    ["Workiz", "https://app.workiz.com/", "Leads, jobs, automations"],
+    ["Your booking page", BOOKING_URL, "Where every ad should send people"],
+    ["Your website", WEBSITE_URL, "upclosets.com/rhode-island"],
+  ];
+  return { html: `
+    <div class="grid g3">${L.map(([n, u, d]) => `<a class="card" href="${esc(u)}" target="_blank" rel="noopener" style="padding:16px;color:inherit;text-decoration:none;display:block"><b>${esc(n)} ↗</b><div class="muted small" style="margin-top:4px">${esc(d)}</div></a>`).join("")}</div>
+    <div class="card" style="margin-top:16px"><div class="card-h"><h3>Tracking link builder</h3></div><div class="card-b">
+      <div class="form-row"><label class="wide">Send people to<select id="ub-base"><option value="${esc(BOOKING_URL)}">Booking page</option><option value="${esc(WEBSITE_URL)}">Website</option></select></label>
+        <label>Source<input id="ub-src" value="facebook" /></label><label>Medium<input id="ub-med" value="paid_social" /></label></div>
+      <div class="form-row" style="margin-top:10px"><label class="wide">Campaign name<input id="ub-camp" value="winter_closet_promo" /></label></div>
+      <input id="ub-out" readonly style="margin-top:10px" /><button class="btn small" id="ub-copy" style="margin-top:8px">⧉ Copy link</button>
+      <p class="muted small">How tracking works here: the dashboard counts results by the lead source (ad group) set in Workiz. Use these links in ads and QR codes, and give each campaign a matching ad group in Workiz (for example "Facebook - Lakyn" or "Yard Signs") so sales are credited correctly.</p></div></div>`,
+    mount() {
+      const upd = () => { const b = $("#ub-base").value; $("#ub-out").value = `${b}${b.includes("?") ? "&" : "?"}utm_source=${encodeURIComponent($("#ub-src").value)}&utm_medium=${encodeURIComponent($("#ub-med").value)}&utm_campaign=${encodeURIComponent($("#ub-camp").value)}`; };
+      ["#ub-base", "#ub-src", "#ub-med", "#ub-camp"].forEach((s) => $(s).oninput = upd); upd();
+      $("#ub-copy").onclick = async () => { try { await navigator.clipboard.writeText($("#ub-out").value); toast("Copied"); } catch { toast("Copy blocked", true); } };
+    } };
+}
