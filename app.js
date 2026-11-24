@@ -400,7 +400,268 @@ VIEWS.payments = () => {
       <div class="card kpi purple"><span class="label">Deposits requested (pending estimates)</span><span class="value num">${money0(D.estimates.filter((e) => /pending/i.test(e.status)).reduce((s, e) => s + num(e.deposit_due), 0))}</span></div>
     </div>`);
 };
-VIEWS.pricebook = () => view(`<div class="page-head"><h2>Price book</h2></div>${needsPermission("The price book", "Items")}`);
+// ---------- price book (dashboard-owned, from your pricing sheet) ----------
+const PB = { items: null, parts: null, settings: null };
+async function loadPricing(force = false) {
+  if (PB.items && !force) return;
+  const [a, b, c] = await Promise.all([
+    sb.from("price_book").select("*").order("sheet").order("category").order("name").limit(5000),
+    sb.from("part_prices").select("*").order("part_no").limit(5000),
+    sb.from("pricing_settings").select("*").eq("id", 1).single(),
+  ]);
+  if (a.error) throw a.error;
+  PB.items = a.data; PB.parts = b.data || []; PB.settings = c.data || { markup_pct: 100, labor_rate: 45 };
+}
+const sellPrice = (it) => (it.retail != null ? num(it.retail) : num(it.published_price));
+
+VIEWS.pricebook = async () => {
+  view(`<div class="empty">Loading price book…</div>`);
+  try { await loadPricing(); } catch (e) { return view(`<div class="notice">${esc(e.message)}</div>`); }
+  const sheets = ["Part costs", ...new Set(PB.items.map((i) => i.sheet))];
+  const tb = tabs("pb", sheets.map((s) => ({ id: s, label: s, sub: s === "Part costs" ? `${PB.parts.length} parts` : `${PB.items.filter((i) => i.sheet === s).length} items` })), () => VIEWS.pricebook());
+  const active = tb.active();
+  let t;
+  if (active === "Part costs") {
+    t = table("parts", { rows: PB.parts, search: (p) => [p.part_no, p.description, p.supplier].join(" "),
+      cols: [
+        { label: "Part #", key: "part_no", render: (p) => `<b>${esc(p.part_no)}</b>` },
+        { label: "Description", key: "description" },
+        { label: "Supplier", key: "supplier", render: (p) => `<span class="badge ${p.supplier === "Tidy Squares" ? "b-orange" : p.supplier === "Häfele" ? "b-purple" : ""}">${esc(p.supplier || "Other")}</span>` },
+        { label: "Your cost (each)", key: "unit_cost", right: true, render: (p) => `<input type="number" step="0.01" min="0" data-part="${esc(p.part_no)}" value="${p.unit_cost ?? ""}" placeholder="enter cost" style="max-width:120px;text-align:right" />` },
+        { label: "Updated", key: "updated_at", render: (p) => esc(fmtDate(p.updated_at)) },
+      ] });
+  } else {
+    t = table("pb-" + active, { rows: PB.items.filter((i) => i.sheet === active), search: (i) => [i.name, i.sku, i.category].join(" "),
+      cols: [
+        { label: "Category", key: "category" },
+        { label: "Product", key: "name", render: (i) => `${esc(i.name)}<span class="sub">${esc(i.sku || "")}</span>` },
+        { label: "Unit", key: "unit" },
+        { label: "Published", key: "published_price", right: true, render: (i) => i.published_price != null ? money(i.published_price) : "—" },
+        { label: "Dealer cost", key: "dealer_cost", right: true, render: (i) => `<input type="number" step="0.01" min="0" data-pb="${i.id}" data-f="dealer_cost" value="${i.dealer_cost ?? ""}" style="max-width:110px;text-align:right" />` },
+        { label: "Your retail", key: "retail", right: true, render: (i) => `<input type="number" step="0.01" min="0" data-pb="${i.id}" data-f="retail" value="${i.retail ?? ""}" placeholder="${i.published_price ?? ""}" style="max-width:110px;text-align:right" />` },
+        { label: "Margin", key: "retail", right: true, sort: (i) => (num(sellPrice(i)) ? (sellPrice(i) - num(i.dealer_cost)) / sellPrice(i) : 0), render: (i) => i.dealer_cost != null && sellPrice(i) ? `${Math.round(((sellPrice(i) - num(i.dealer_cost)) / sellPrice(i)) * 100)}%` : "—" },
+      ] });
+  }
+  view(`<div class="page-head"><h2>Price book</h2><div class="spacer"></div>
+      <label style="flex-direction:row;align-items:center;gap:8px">Default markup %<input id="set-markup" type="number" value="${PB.settings.markup_pct}" style="width:90px" /></label>
+      <label style="flex-direction:row;align-items:center;gap:8px">Labor $/hr<input id="set-rate" type="number" value="${PB.settings.labor_rate}" style="width:90px" /></label></div>
+    <div class="notice" style="margin-bottom:14px">Loaded from your <b>Product Pricing Working Sheet</b>. Those prices are historical (2024–2026), so treat them as <b>test prices</b>. "Your retail" overrides the published price on estimates. <b>Part costs</b> fill in automatically from designer imports: enter a part's cost once and every future design uses it.</div>
+    ${tb.html}${t.html}`);
+  tb.mount(); t.mount();
+  $$("input[data-pb]").forEach((inp) => inp.onchange = async () => {
+    const v = inp.value === "" ? null : Number(inp.value);
+    const { error } = await sb.from("price_book").update({ [inp.dataset.f]: v, updated_at: new Date().toISOString() }).eq("id", inp.dataset.pb);
+    if (error) return toast(error.message, true);
+    const it = PB.items.find((x) => String(x.id) === inp.dataset.pb); if (it) it[inp.dataset.f] = v; toast("Saved");
+  });
+  $$("input[data-part]").forEach((inp) => inp.onchange = async () => {
+    const v = inp.value === "" ? null : Number(inp.value);
+    const { error } = await sb.from("part_prices").update({ unit_cost: v, updated_at: new Date().toISOString() }).eq("part_no", inp.dataset.part);
+    if (error) return toast(error.message, true);
+    const p = PB.parts.find((x) => x.part_no === inp.dataset.part); if (p) p.unit_cost = v; toast("Saved");
+  });
+  const saveSet = async () => {
+    const patch = { markup_pct: num($("#set-markup").value), labor_rate: num($("#set-rate").value), updated_at: new Date().toISOString() };
+    const { error } = await sb.from("pricing_settings").update(patch).eq("id", 1);
+    if (error) return toast(error.message, true); Object.assign(PB.settings, patch); toast("Defaults saved");
+  };
+  $("#set-markup").onchange = saveSet; $("#set-rate").onchange = saveSet;
+};
+
+// ---------- estimate builder ----------
+const supplierOf = (pn) => /^(TS|CTP)/i.test(pn) ? "Tidy Squares" : /^\d{3}\.\d{2}\.\d{3}$/.test(pn) ? "Häfele" : "Other";
+
+async function parsePartsPdf(file) {
+  const pdfjs = await import("https://cdn.jsdelivr.net/npm/pdfjs-dist@4.7.76/build/pdf.min.mjs");
+  pdfjs.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.7.76/build/pdf.worker.min.mjs";
+  const doc = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
+  const parts = new Map(); let designName = ""; const options = {};
+  for (let p = 1; p <= doc.numPages; p++) {
+    const tc = await (await doc.getPage(p)).getTextContent();
+    const rows = new Map();
+    tc.items.forEach((it) => { if (!it.str.trim()) return; const y = Math.round(it.transform[5] / 2) * 2; if (!rows.has(y)) rows.set(y, []); rows.get(y).push({ x: it.transform[4], s: it.str.trim() }); });
+    [...rows.entries()].sort((a, b) => b[0] - a[0]).forEach(([, cells]) => {
+      cells.sort((a, b) => a.x - b.x); const s = cells.map((c) => c.s);
+      if (!designName && /\d{1,2}\/\d{1,2}\/\d{4}/.test(s.join(" "))) designName = s[0];
+      const opt = s.join(" ").match(/^(Tower Depth|Closet Finish|Base Notch|Closet Rod Profile|Closet Rod Finish|Total Inches of Hanging):\s*(.+)$/);
+      if (opt) options[opt[1]] = opt[2];
+      if (s.length < 3) return;
+      const qty = Number(s[s.length - 1]); const pn = s[s.length - 2];
+      if (!Number.isInteger(qty) || qty <= 0 || !/^[A-Z0-9][A-Z0-9.\-]{3,}$/i.test(pn) || !/\d/.test(pn)) return;
+      const desc = s.slice(0, -2).join(" ");
+      if (/^description$/i.test(desc)) return;
+      const cur = parts.get(pn) || { part_no: pn, description: desc, qty: 0, supplier: supplierOf(pn) };
+      cur.qty += qty; parts.set(pn, cur);
+    });
+  }
+  return { designName, options, parts: [...parts.values()] };
+}
+
+async function openEstimate(leadId, existing = null) {
+  await loadPricing();
+  const l = D.leads.find((x) => x.workiz_id === leadId) || {};
+  const E = existing ? structuredClone(existing) : { lead_id: leadId, design_name: "", files: [], parts: [], extras: [], labor_hours: 0, labor_rate: num(PB.settings.labor_rate), markup_pct: num(PB.settings.markup_pct), status: "draft" };
+  E.parts ||= []; E.extras ||= []; E.files ||= [];
+  const costOf = (pn) => PB.parts.find((p) => p.part_no === pn)?.unit_cost;
+  E.parts.forEach((p) => { if (p.unit_cost == null && costOf(p.part_no) != null) p.unit_cost = num(costOf(p.part_no)); });
+
+  const calc = () => {
+    const partsCost = E.parts.reduce((s, p) => s + num(p.qty) * num(p.unit_cost), 0);
+    const laborCost = num(E.labor_hours) * num(E.labor_rate);
+    const systemPrice = (partsCost + laborCost) * (1 + num(E.markup_pct) / 100);
+    const extrasPrice = E.extras.reduce((s, x) => s + num(x.qty) * num(x.unit_price), 0);
+    const extrasCost = E.extras.reduce((s, x) => s + num(x.qty) * num(x.unit_cost), 0);
+    const total = systemPrice + extrasPrice, cost = partsCost + laborCost + extrasCost;
+    return { partsCost, laborCost, systemPrice, extrasPrice, extrasCost, total, cost, profit: total - cost, missing: E.parts.filter((p) => p.unit_cost == null || p.unit_cost === "").length };
+  };
+
+  const render = () => {
+    const c = calc();
+    const bySup = ["Tidy Squares", "Häfele", "Other"].map((s) => ({ s, rows: E.parts.filter((p) => p.supplier === s) })).filter((g) => g.rows.length);
+    $("#drawer-panel").innerHTML = `
+      <div class="d-head"><div><div class="muted small">ESTIMATE ${E.id ? "#" + E.id : "(new)"} · ${esc(l.uuid || "")}</div><h2>${esc(l.client_name || "Estimate")}</h2>
+        <div class="muted small">${esc(E.design_name || "No design imported yet")}</div></div><div class="spacer"></div><button class="icon-btn" id="d-close">✕</button></div>
+
+      <div class="profit-box">
+        <div><div class="l">Customer price</div><div class="v num">${money(c.total)}</div></div>
+        <div><div class="l">Your cost</div><div class="v num">${money(c.cost)}</div></div>
+        <div><div class="l">Profit</div><div class="v num ${c.profit >= 0 ? "pos" : "neg"}">${money(c.profit)}</div></div>
+        <div><div class="l">Margin</div><div class="v num">${c.total ? Math.round((c.profit / c.total) * 100) + "%" : "—"}</div></div></div>
+      ${c.missing ? `<div class="warn" style="margin-top:10px">${c.missing} part${c.missing > 1 ? "s have" : " has"} no cost yet. Enter them below (from your Häfele cart or Tidy Squares invoice); they're remembered for next time.</div>` : ""}
+
+      <div class="d-section"><h3>1 · Import design from the Up Closets designer</h3>
+        <label class="dropzone" for="e-files">⇪ Drop or pick the designer PDFs (the "Installation with Elevations" PDF has the parts list). Pick several at once.</label>
+        <input id="e-files" type="file" accept=".pdf,image/*" multiple class="hidden" />
+        ${E.files.length ? `<div class="muted small" style="margin-top:6px">Files: ${E.files.map((f) => esc(f.name)).join(", ")}</div>` : ""}
+        ${E.options && Object.keys(E.options).length ? `<div class="kv" style="margin-top:10px">${Object.entries(E.options).map(([k, v]) => `<div>${esc(k)}</div><div>${esc(v)}</div>`).join("")}</div>` : ""}</div>
+
+      <div class="d-section"><h3>2 · Closet system parts (your cost)</h3>
+        ${bySup.map((g) => `<div class="card" style="margin-bottom:10px"><div class="card-h"><h3>${esc(g.s)}</h3><div class="spacer"></div><span class="muted small num">${money(g.rows.reduce((s, p) => s + num(p.qty) * num(p.unit_cost), 0))}</span></div>
+          <div class="table-wrap"><table><thead><tr><th>Part #</th><th>Description</th><th class="right">Qty</th><th class="right">Cost each</th><th class="right">Line</th><th></th></tr></thead><tbody>
+          ${g.rows.map((p) => { const i = E.parts.indexOf(p); return `<tr><td><b>${esc(p.part_no)}</b></td><td>${esc(p.description)}</td>
+            <td class="right"><input type="number" min="0" step="1" data-pq="${i}" value="${p.qty}" style="width:70px;text-align:right" /></td>
+            <td class="right"><input type="number" min="0" step="0.01" data-pc="${i}" value="${p.unit_cost ?? ""}" placeholder="cost?" style="width:100px;text-align:right;${p.unit_cost == null || p.unit_cost === "" ? "border-color:var(--orange)" : ""}" /></td>
+            <td class="right num">${money(num(p.qty) * num(p.unit_cost))}</td><td class="right"><button class="btn small danger" data-pdel="${i}">✕</button></td></tr>`; }).join("")}
+          </tbody></table></div></div>`).join("") || `<div class="muted small">Import a design above, or add parts by hand:</div>`}
+        <div class="form-row" style="margin-top:8px"><label>Part #<input id="np-pn" /></label><label class="wide">Description<input id="np-desc" /></label><label>Qty<input id="np-qty" type="number" value="1" min="1" /></label></div>
+        <button class="btn small" id="np-add" style="margin-top:8px">＋ Add part</button>
+        ${E.parts.length ? `<button class="btn small" id="e-hafele-csv" style="margin-top:8px">⇩ Häfele cart spreadsheet</button>` : ""}</div>
+
+      <div class="d-section"><h3>3 · Labor & markup</h3>
+        <div class="form-row"><label>Install hours<input id="e-hours" type="number" min="0" step="0.5" value="${E.labor_hours}" /></label>
+          <label>Labor $/hr<input id="e-rate" type="number" min="0" step="1" value="${E.labor_rate}" /></label>
+          <label>Markup %<input id="e-markup" type="number" min="0" step="5" value="${E.markup_pct}" /></label>
+          <label>Closet system price<input disabled value="${money(c.systemPrice)}" /></label></div>
+        <p class="muted small">System price = (parts ${money(c.partsCost)} + labor ${money(c.laborCost)}) × (1 + markup).</p></div>
+
+      <div class="d-section"><h3>4 · Accessories & add-ons (from your price book)</h3>
+        <div class="card"><div class="table-wrap"><table><thead><tr><th>Item</th><th class="right">Qty</th><th class="right">Price each</th><th class="right">Line</th><th></th></tr></thead><tbody>
+        ${E.extras.map((x, i) => `<tr><td>${esc(x.name)}<span class="sub">${esc(x.sku || "")}${x.unit_cost != null ? ` · cost ${money(x.unit_cost)}` : ""}</span></td>
+          <td class="right"><input type="number" min="0" data-xq="${i}" value="${x.qty}" style="width:70px;text-align:right" /></td>
+          <td class="right"><input type="number" min="0" step="0.01" data-xp="${i}" value="${x.unit_price}" style="width:100px;text-align:right" /></td>
+          <td class="right num">${money(num(x.qty) * num(x.unit_price))}</td><td class="right"><button class="btn small danger" data-xdel="${i}">✕</button></td></tr>`).join("") || `<tr><td colspan="5"><div class="empty">No add-ons</div></td></tr>`}
+        </tbody></table></div></div>
+        <div class="form-row" style="margin-top:8px"><label class="wide" style="grid-column:span 3">Add from price book<input id="x-search" list="pb-list" placeholder="Type to search: tie rack, basket, hook, LED…" /></label>
+          <datalist id="pb-list">${PB.items.filter((i) => sellPrice(i) || i.dealer_cost).map((i) => `<option value="${esc(i.name)}${i.sku ? " · " + esc(i.sku) : ""} #${i.id}">`).join("")}</datalist>
+          <button class="btn small purple" id="x-add">＋ Add</button></div></div>
+
+      <div class="d-section"><h3>Summary</h3><div class="kv">
+        <div>Closet system</div><div class="num">${money(c.systemPrice)}</div>
+        <div>Accessories</div><div class="num">${money(c.extrasPrice)}</div>
+        <div><b>Total to customer</b></div><div class="num"><b>${money(c.total)}</b></div>
+        <div>Deposit (50%)</div><div class="num">${money(c.total / 2)}</div></div></div>
+
+      <div class="modal-actions" style="justify-content:flex-start;flex-wrap:wrap">
+        <button class="btn primary" id="e-save">Save estimate</button>
+        <button class="btn" id="e-print">Print / PDF</button>
+        <button class="btn" disabled title="Turn on Estimates: Read & Write for the Workiz key first">Send to Workiz (needs Estimates permission)</button>
+      </div>`;
+    wire();
+  };
+
+  const upsertPartPrice = async (p) => {
+    if (p.unit_cost == null || p.unit_cost === "") return;
+    await sb.from("part_prices").upsert({ part_no: p.part_no, description: p.description, supplier: p.supplier, unit_cost: num(p.unit_cost), updated_at: new Date().toISOString() }, { onConflict: "part_no" });
+    const ex = PB.parts.find((x) => x.part_no === p.part_no); if (ex) ex.unit_cost = num(p.unit_cost); else PB.parts.push({ part_no: p.part_no, description: p.description, supplier: p.supplier, unit_cost: num(p.unit_cost) });
+  };
+
+  const wire = () => {
+    $("#d-close").onclick = () => closeDrawer();
+    $("#e-files").onchange = async (ev) => {
+      const files = [...ev.target.files]; if (!files.length) return;
+      toast(`Reading ${files.length} file(s)…`);
+      for (const f of files) {
+        const path = `designs/${leadId}/${Date.now()}-${f.name.replace(/[^\w.-]+/g, "_")}`;
+        const up = await sb.storage.from("job-photos").upload(path, f, { contentType: f.type || "application/pdf" });
+        E.files.push({ name: f.name, path: up.error ? null : path });
+        if (/pdf$/i.test(f.name) || f.type === "application/pdf") {
+          try {
+            const r = await parsePartsPdf(f);
+            if (r.designName && !E.design_name) E.design_name = r.designName;
+            if (Object.keys(r.options).length) E.options = { ...(E.options || {}), ...r.options };
+            r.parts.forEach((np) => { const cur = E.parts.find((p) => p.part_no === np.part_no); if (cur) cur.qty = Math.max(num(cur.qty), np.qty); else E.parts.push({ ...np, unit_cost: costOf(np.part_no) ?? null }); });
+          } catch (e) { toast(`Couldn't read ${f.name}: ${e.message}`, true); }
+        }
+      }
+      // remember every part number (cost may be blank) so it appears in Part costs
+      const newParts = E.parts.filter((p) => !PB.parts.find((x) => x.part_no === p.part_no));
+      if (newParts.length) { await sb.from("part_prices").upsert(newParts.map((p) => ({ part_no: p.part_no, description: p.description, supplier: p.supplier })), { onConflict: "part_no", ignoreDuplicates: true }); newParts.forEach((p) => PB.parts.push({ part_no: p.part_no, description: p.description, supplier: p.supplier, unit_cost: null })); }
+      toast(`Found ${E.parts.length} parts`); render();
+    };
+    $$("[data-pq]").forEach((i) => i.onchange = () => { E.parts[i.dataset.pq].qty = num(i.value); render(); });
+    $$("[data-pc]").forEach((i) => i.onchange = async () => { const p = E.parts[i.dataset.pc]; p.unit_cost = i.value === "" ? null : num(i.value); await upsertPartPrice(p); render(); });
+    $$("[data-pdel]").forEach((b) => b.onclick = () => { E.parts.splice(Number(b.dataset.pdel), 1); render(); });
+    $("#np-add").onclick = () => { const pn = $("#np-pn").value.trim(); if (!pn) return toast("Enter a part #", true); E.parts.push({ part_no: pn, description: $("#np-desc").value, qty: num($("#np-qty").value) || 1, supplier: supplierOf(pn), unit_cost: costOf(pn) ?? null }); render(); };
+    $("#e-hours").onchange = (e) => { E.labor_hours = num(e.target.value); render(); };
+    $("#e-rate").onchange = (e) => { E.labor_rate = num(e.target.value); render(); };
+    $("#e-markup").onchange = (e) => { E.markup_pct = num(e.target.value); render(); };
+    $$("[data-xq]").forEach((i) => i.onchange = () => { E.extras[i.dataset.xq].qty = num(i.value); render(); });
+    $$("[data-xp]").forEach((i) => i.onchange = () => { E.extras[i.dataset.xp].unit_price = num(i.value); render(); });
+    $$("[data-xdel]").forEach((b) => b.onclick = () => { E.extras.splice(Number(b.dataset.xdel), 1); render(); });
+    $("#x-add").onclick = () => {
+      const m = $("#x-search").value.match(/#(\d+)$/); const it = m && PB.items.find((i) => String(i.id) === m[1]);
+      if (!it) return toast("Pick an item from the list", true);
+      E.extras.push({ id: it.id, name: it.name, sku: it.sku, qty: 1, unit_price: sellPrice(it) || num(it.dealer_cost) * (1 + num(E.markup_pct) / 100), unit_cost: it.dealer_cost });
+      render();
+    };
+    const csv = $("#e-hafele-csv");
+    if (csv) csv.onclick = () => {
+      const rows = E.parts.filter((p) => p.supplier === "Häfele");
+      if (!rows.length) return toast("No Häfele parts in this design", true);
+      const text = "Item Number,Quantity\n" + rows.map((p) => `${p.part_no},${p.qty}`).join("\n");
+      const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([text], { type: "text/csv" }));
+      a.download = `hafele-${(l.client_name || "design").replace(/\W+/g, "-")}.csv`; a.click();
+    };
+    $("#e-save").onclick = async () => {
+      const c = calc();
+      const row = { lead_id: E.lead_id, design_name: E.design_name, files: E.files, parts: E.parts, extras: E.extras, labor_hours: E.labor_hours, labor_rate: E.labor_rate, markup_pct: E.markup_pct, materials_cost: c.partsCost, price: c.total, status: "draft" };
+      const res = E.id ? await sb.from("design_imports").update(row).eq("id", E.id).select().single() : await sb.from("design_imports").insert(row).select().single();
+      if (res.error) return toast(res.error.message, true);
+      E.id = res.data.id; toast("Estimate saved"); render();
+    };
+    $("#e-print").onclick = () => printEstimate(E, l, calc());
+  };
+  openDrawer(""); render();
+}
+
+function printEstimate(E, l, c) {
+  const w = window.open("", "_blank");
+  w.document.write(`<!doctype html><html><head><title>Estimate · ${esc(l.client_name || "")}</title><style>
+    body{font:14px/1.5 Poppins,Arial,sans-serif;color:#111;max-width:780px;margin:30px auto;padding:0 20px}
+    h1{font-size:22px;margin:0} .muted{color:#666} table{width:100%;border-collapse:collapse;margin:14px 0} td,th{padding:8px;border-bottom:1px solid #ddd;text-align:left} .r{text-align:right}
+    .tot td{font-weight:700;font-size:16px;border-top:2px solid #111} img{width:200px}</style></head><body>
+    <img src="${location.origin}/assets/logo-dark.png" style="background:#111;padding:10px;border-radius:8px" />
+    <h1>Estimate</h1><div class="muted">${new Date().toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })}</div>
+    <p><b>${esc(l.client_name || "")}</b><br>${esc(l.address || "")}<br>${esc(phone(l.client_phone))} ${esc(l.client_email || "")}</p>
+    <p><b>${esc(E.design_name || "Custom closet")}</b>${E.options ? "<br><span class='muted'>" + Object.entries(E.options).map(([k, v]) => `${esc(k)}: ${esc(v)}`).join(" · ") + "</span>" : ""}</p>
+    <table><tr><th>Description</th><th class="r">Qty</th><th class="r">Amount</th></tr>
+      <tr><td>Custom closet system, designed, supplied and installed</td><td class="r">1</td><td class="r">${money(c.systemPrice)}</td></tr>
+      ${E.extras.map((x) => `<tr><td>${esc(x.name)}</td><td class="r">${num(x.qty)}</td><td class="r">${money(num(x.qty) * num(x.unit_price))}</td></tr>`).join("")}
+      <tr class="tot"><td>Total</td><td></td><td class="r">${money(c.total)}</td></tr>
+      <tr><td>Deposit due to schedule (50%)</td><td></td><td class="r">${money(c.total / 2)}</td></tr></table>
+    <p class="muted">Up Closets of Rhode Island · rhodeisland@upclosets.com</p><script>setTimeout(()=>print(),400)<\/script></body></html>`);
+  w.document.close();
+}
 
 VIEWS.reports = () => {
   const done = D.jobs.filter((j) => /done/i.test(j.status));
@@ -585,8 +846,15 @@ function openLead(id) {
       <label style="margin-top:10px">Notes<textarea id="f-notes" rows="2">${esc(l.dash_notes || "")}</textarea></label>
       <div style="margin-top:10px"><button class="btn primary small" id="f-save">Save details</button></div></div>
     <div class="d-section"><h3>Estimates</h3>${ests.map((e) => `<div class="note">${badge(e.status)} <b>${esc(e.serial_id)}</b> · ${money(e.total)} <span class="muted small">· ${esc(fmtDate(e.created_local))}</span>${e.notes ? `<div class="muted small">${esc(e.notes)}</div>` : ""}</div>`).join("") || '<div class="muted small">No estimates yet</div>'}
-      <button class="btn small" disabled title="Needs a sample eCab export first">⇪ Import eCab design (coming soon)</button></div>`);
+      <h3 style="margin-top:14px">Dashboard estimates</h3><div id="lead-drafts" class="muted small">Loading…</div>
+      <button class="btn primary small" id="new-est" style="margin-top:8px">＋ New estimate (import design)</button></div>`);
   $("#d-close").onclick = () => closeDrawer();
+  $("#new-est").onclick = () => openEstimate(id);
+  sb.from("design_imports").select("*").eq("lead_id", id).order("created_at", { ascending: false }).then(({ data }) => {
+    const el = $("#lead-drafts"); if (!el) return;
+    el.innerHTML = (data || []).map((d) => `<a class="note" style="display:block;color:inherit;cursor:pointer" data-draft="${d.id}">${badge(d.status)} <b>${esc(d.design_name || "Estimate")}</b> · ${money(d.price)} <span class="muted small">· ${esc(fmtDate(d.created_at))}</span></a>`).join("") || "None yet";
+    $$("[data-draft]").forEach((a) => a.onclick = () => openEstimate(id, data.find((d) => String(d.id) === a.dataset.draft)));
+  });
   $("#f-save").onclick = async () => {
     const patch = { workiz_id: id, dash_closet_type: $("#f-type").value || null, dash_measurements: $("#f-meas").value || null, dash_notes: $("#f-notes").value || null, dash_estimated_price: $("#f-price").value === "" ? null : Number($("#f-price").value) };
     const { error } = await sb.from("leads").upsert(patch, { onConflict: "workiz_id" });
