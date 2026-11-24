@@ -360,8 +360,24 @@ VIEWS.estimates = () => {
       { label: "Deposit due", key: "deposit_due", right: true, render: (e) => money(e.deposit_due) },
       { label: "Notes", key: "notes", render: (e) => `<span class="muted small">${esc((e.notes || "").slice(0, 80))}</span>` },
     ] });
-  view(`<div class="page-head"><h2>Estimates</h2><div class="spacer"></div><span class="muted small">Editing estimates happens in Workiz for now. eCab import coming next.</span></div>${tb.html}${t.html}`);
+  view(`<div class="page-head"><h2>Estimates</h2><div class="spacer"></div><button class="btn primary" id="new-est-any">＋ New estimate</button></div>
+    <div class="card" style="margin-bottom:18px"><div class="card-h"><h3>Dashboard estimates</h3><span class="muted small">built here from designer PDFs · click to edit</span></div>
+      <div class="table-wrap"><table><thead><tr><th>#</th><th>Design</th><th>Customer</th><th class="right">Your cost</th><th class="right">Price</th><th class="right">Margin</th><th>Status</th><th>Updated</th></tr></thead><tbody id="dash-est"><tr><td colspan="8"><div class="empty">Loading…</div></td></tr></tbody></table></div></div>
+    <h3 style="margin:0 0 10px">Workiz estimates</h3>${tb.html}${t.html}`);
   tb.mount(); t.mount();
+  $("#new-est-any").onclick = () => openEstimate(null);
+  sb.from("design_imports").select("*").order("created_at", { ascending: false }).then(({ data, error }) => {
+    const el = $("#dash-est"); if (!el) return;
+    if (error) return (el.innerHTML = `<tr><td colspan="8">${esc(error.message)}</td></tr>`);
+    el.innerHTML = (data || []).map((d) => {
+      const lead = D.leads.find((x) => x.workiz_id === d.lead_id);
+      const cost = num(d.materials_cost) + num(d.labor_hours) * num(d.labor_rate) + (d.extras || []).reduce((s, x) => s + num(x.qty) * num(x.unit_cost), 0);
+      return `<tr class="click" data-de="${d.id}"><td><b>${d.id}</b></td><td>${esc(d.design_name || "—")}<span class="sub">${(d.parts || []).length} parts${(d.extras || []).length ? ` · ${(d.extras || []).length} add-ons` : ""}</span></td>
+        <td>${esc(lead?.client_name || "Not linked yet")}</td><td class="right num">${money(cost)}</td><td class="right num">${money(d.price)}</td>
+        <td class="right num">${num(d.price) ? Math.round(((num(d.price) - cost) / num(d.price)) * 100) + "%" : "—"}</td><td>${badge(d.status)}</td><td>${esc(fmtDate(d.created_at))}</td></tr>`;
+    }).join("") || `<tr><td colspan="8"><div class="empty">No dashboard estimates yet. Click "New estimate".</div></td></tr>`;
+    $$("[data-de]").forEach((tr) => tr.onclick = () => { const d = data.find((x) => String(x.id) === tr.dataset.de); openEstimate(d.lead_id, d); });
+  });
 };
 
 VIEWS.invoices = () => {
@@ -499,8 +515,8 @@ async function parsePartsPdf(file) {
 
 async function openEstimate(leadId, existing = null) {
   await loadPricing();
-  const l = D.leads.find((x) => x.workiz_id === leadId) || {};
-  const E = existing ? structuredClone(existing) : { lead_id: leadId, design_name: "", files: [], parts: [], extras: [], labor_hours: 0, labor_rate: num(PB.settings.labor_rate), markup_pct: num(PB.settings.markup_pct), status: "draft" };
+  let l = D.leads.find((x) => x.workiz_id === leadId) || {};
+  const E = existing ? structuredClone(existing) : { lead_id: leadId || null, design_name: "", files: [], parts: [], extras: [], labor_hours: 0, labor_rate: num(PB.settings.labor_rate), markup_pct: num(PB.settings.markup_pct), status: "draft" };
   E.parts ||= []; E.extras ||= []; E.files ||= [];
   const costOf = (pn) => PB.parts.find((p) => p.part_no === pn)?.unit_cost;
   E.parts.forEach((p) => { if (p.unit_cost == null && costOf(p.part_no) != null) p.unit_cost = num(costOf(p.part_no)); });
@@ -521,6 +537,9 @@ async function openEstimate(leadId, existing = null) {
     $("#drawer-panel").innerHTML = `
       <div class="d-head"><div><div class="muted small">ESTIMATE ${E.id ? "#" + E.id : "(new)"} · ${esc(l.uuid || "")}</div><h2>${esc(l.client_name || "Estimate")}</h2>
         <div class="muted small">${esc(E.design_name || "No design imported yet")}</div></div><div class="spacer"></div><button class="icon-btn" id="d-close">✕</button></div>
+      <div class="form-row" style="margin-bottom:14px"><label class="wide" style="grid-column:span 3">Customer (lead)<input id="e-lead" list="lead-list" placeholder="Type a name to link this estimate to a lead" value="${l.workiz_id ? esc(`${l.client_name} · ${l.uuid} #${l.workiz_id}`) : ""}" /></label>
+        <datalist id="lead-list">${D.leads.filter((x) => !x.lost).map((x) => `<option value="${esc(`${x.client_name} · ${x.uuid} #${x.workiz_id}`)}">`).join("")}</datalist>
+        <label>Design name<input id="e-name" value="${esc(E.design_name || "")}" /></label></div>
 
       <div class="profit-box">
         <div><div class="l">Customer price</div><div class="v num">${money(c.total)}</div></div>
@@ -587,11 +606,13 @@ async function openEstimate(leadId, existing = null) {
 
   const wire = () => {
     $("#d-close").onclick = () => closeDrawer();
+    $("#e-lead").onchange = (ev) => { const m = ev.target.value.match(/#(LD-[\w-]+)$/); const nl = m && D.leads.find((x) => x.workiz_id === m[1]); E.lead_id = nl ? nl.workiz_id : null; l = nl || {}; render(); };
+    $("#e-name").onchange = (ev) => { E.design_name = ev.target.value; };
     $("#e-files").onchange = async (ev) => {
       const files = [...ev.target.files]; if (!files.length) return;
       toast(`Reading ${files.length} file(s)…`);
       for (const f of files) {
-        const path = `designs/${leadId}/${Date.now()}-${f.name.replace(/[^\w.-]+/g, "_")}`;
+        const path = `designs/${E.lead_id || "unassigned"}/${Date.now()}-${f.name.replace(/[^\w.-]+/g, "_")}`;
         const up = await sb.storage.from("job-photos").upload(path, f, { contentType: f.type || "application/pdf" });
         E.files.push({ name: f.name, path: up.error ? null : path });
         if (/pdf$/i.test(f.name) || f.type === "application/pdf") {
@@ -634,10 +655,11 @@ async function openEstimate(leadId, existing = null) {
     };
     $("#e-save").onclick = async () => {
       const c = calc();
-      const row = { lead_id: E.lead_id, design_name: E.design_name, files: E.files, parts: E.parts, extras: E.extras, labor_hours: E.labor_hours, labor_rate: E.labor_rate, markup_pct: E.markup_pct, materials_cost: c.partsCost, price: c.total, status: "draft" };
+      const row = { lead_id: E.lead_id, design_name: E.design_name, options: E.options || null, files: E.files, parts: E.parts, extras: E.extras, labor_hours: E.labor_hours, labor_rate: E.labor_rate, markup_pct: E.markup_pct, materials_cost: c.partsCost, price: c.total, status: "draft" };
       const res = E.id ? await sb.from("design_imports").update(row).eq("id", E.id).select().single() : await sb.from("design_imports").insert(row).select().single();
       if (res.error) return toast(res.error.message, true);
       E.id = res.data.id; toast("Estimate saved"); render();
+      if (location.hash.startsWith("#/estimates")) VIEWS.estimates();
     };
     $("#e-print").onclick = () => printEstimate(E, l, calc());
   };
