@@ -56,7 +56,56 @@ async function loadAll() {
   const err = [jobs, leads, clients, estimates, invoices, crew, sync, ls].find((r) => r.error);
   if (err) throw err.error;
   Object.assign(D, { jobs: jobs.data, leads: leads.data, clients: clients.data, estimates: estimates.data, invoices: invoices.data, crew: crew.data, sync: sync.data, leadStatuses: ls.data.map((r) => r.data?.name).filter(Boolean) });
+  const td = await sb.from("todos").select("id", { count: "exact", head: true }).eq("done", false);
+  D.todosOpen = td.count || 0;
   renderSync(); renderNav();
+}
+
+// ---------- to-do ----------
+async function viewTodo() {
+  view(`<div class="empty">Loading…</div>`);
+  const { data, error } = await sb.from("todos").select("*").order("section").order("sort").order("id");
+  if (error) return view(`<div class="notice">${esc(error.message)}</div>`);
+  const sections = [...new Set(data.map((t) => t.section))];
+  const done = data.filter((t) => t.done).length;
+  const gmail = (t) => `https://mail.google.com/mail/?authuser=rhodeisland@upclosets.com&view=cm&fs=1&to=${encodeURIComponent(/@/.test(t.email_to || "") ? t.email_to : "")}&cc=${encodeURIComponent(t.email_cc || "")}&su=${encodeURIComponent(t.email_subject || "")}&body=${encodeURIComponent(t.email_body || "")}`;
+  view(`<div class="page-head"><h2>To-do</h2><span class="muted">${done} of ${data.length} done</span><div class="spacer"></div></div>
+    <div class="card" style="margin-bottom:18px;padding:12px 16px"><div class="hbar" style="grid-template-columns:1fr 60px"><div class="track"><div class="fill" style="width:${data.length ? (done / data.length) * 100 : 0}%"></div></div><span class="right num">${data.length ? Math.round((done / data.length) * 100) : 0}%</span></div></div>
+    ${sections.map((s) => `<div class="card" style="margin-bottom:16px"><div class="card-h"><h3>${esc(s)}</h3><div class="spacer"></div><span class="muted small">${data.filter((t) => t.section === s && t.done).length}/${data.filter((t) => t.section === s).length}</span></div>
+      <div class="card-b">${data.filter((t) => t.section === s).map((t) => `
+        <div class="todo" style="border-bottom:1px solid var(--line);padding:12px 0;${t.done ? "opacity:.55" : ""}">
+          <label style="flex-direction:row;align-items:flex-start;gap:12px;color:var(--text);font-size:14px;cursor:pointer">
+            <input type="checkbox" data-done="${t.id}" ${t.done ? "checked" : ""} style="width:20px;height:20px;accent-color:var(--orange);margin-top:2px;flex-shrink:0" />
+            <span style="${t.done ? "text-decoration:line-through" : ""}"><b>${esc(t.title)}</b>${t.details ? `<span class="muted small" style="display:block;margin-top:3px">${esc(t.details)}</span>` : ""}</span></label>
+          ${t.email_body ? `<details style="margin:10px 0 0 32px"><summary style="cursor:pointer;color:var(--purple-2);font-size:13px">✉ Email draft: copy and paste</summary>
+            <div class="note" style="margin-top:8px"><div class="kv" style="grid-template-columns:70px 1fr;font-size:12.5px"><div>To</div><div>${esc(t.email_to || "")}</div>${t.email_cc ? `<div>CC</div><div>${esc(t.email_cc)}</div>` : ""}<div>Subject</div><div>${esc(t.email_subject || "")}</div></div>
+            <pre style="white-space:pre-wrap;font:12.5px/1.5 Poppins,sans-serif;margin:10px 0 0;color:var(--text)">${esc(t.email_body)}</pre></div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px"><button class="btn small" data-copy="${t.id}">⧉ Copy email</button><button class="btn small" data-copysub="${t.id}">⧉ Copy subject</button><a class="btn small primary" href="${gmail(t)}" target="_blank" rel="noopener">Open in Gmail ↗</a></div></details>` : ""}
+          <textarea data-notes="${t.id}" rows="1" placeholder="Notes…" style="margin:8px 0 0 32px;width:calc(100% - 32px);min-height:34px">${esc(t.notes || "")}</textarea>
+        </div>`).join("")}</div></div>`).join("")}
+    <div class="card"><div class="card-h"><h3>Add a to-do</h3></div><div class="card-b"><div class="form-row">
+      <label class="wide">Task<input id="td-title" /></label>
+      <label>Section<select id="td-sec">${sections.map((s) => `<option>${esc(s)}</option>`).join("")}</select></label>
+      <button class="btn primary" id="td-add">＋ Add</button></div></div></div>`);
+  const byId = (id) => data.find((t) => String(t.id) === String(id));
+  $$("[data-done]").forEach((cb) => cb.onchange = async () => {
+    const { error } = await sb.from("todos").update({ done: cb.checked, updated_at: new Date().toISOString() }).eq("id", cb.dataset.done);
+    if (error) return toast(error.message, true);
+    D.todosOpen = Math.max(0, (D.todosOpen || 0) + (cb.checked ? -1 : 1)); VIEWS.todo(); renderNav();
+  });
+  $$("[data-notes]").forEach((ta) => ta.onchange = async () => {
+    const { error } = await sb.from("todos").update({ notes: ta.value, updated_at: new Date().toISOString() }).eq("id", ta.dataset.notes);
+    error ? toast(error.message, true) : toast("Note saved");
+  });
+  const copy = async (text) => { try { await navigator.clipboard.writeText(text); toast("Copied"); } catch { toast("Copy blocked by the browser. Select the text instead.", true); } };
+  $$("[data-copy]").forEach((b) => b.onclick = () => copy(byId(b.dataset.copy).email_body));
+  $$("[data-copysub]").forEach((b) => b.onclick = () => copy(byId(b.dataset.copysub).email_subject));
+  $("#td-add").onclick = async () => {
+    const title = $("#td-title").value.trim(); if (!title) return;
+    const { error } = await sb.from("todos").insert({ title, section: $("#td-sec").value, sort: 999 });
+    if (error) return toast(error.message, true);
+    D.todosOpen = (D.todosOpen || 0) + 1; VIEWS.todo(); renderNav();
+  };
 }
 
 function renderSync() {
@@ -70,6 +119,7 @@ function renderSync() {
 // ---------- navigation ----------
 const PAGES = [
   { id: "home", label: "Home", ico: "⌂" },
+  { id: "todo", label: "To-do", ico: "✓", count: () => D.todosOpen || 0 },
   { id: "schedule", label: "Schedule", ico: "▦" },
   { id: "crew", label: "Crew", ico: "☺" },
   { g: "Sales" },
@@ -173,6 +223,7 @@ function salesSeries(range) {
 
 // ---------- views ----------
 const VIEWS = {};
+VIEWS.todo = viewTodo;
 const view = (html) => { $("#view").innerHTML = html; };
 
 VIEWS.home = () => {
