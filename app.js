@@ -128,6 +128,7 @@ const PAGES = [
   { id: "clients", label: "Clients", ico: "☷" },
   { id: "marketing", label: "Marketing", ico: "📣" },
   { g: "Money" },
+  { id: "quote", label: "Quick quote", ico: "⚡" },
   { id: "estimates", label: "Estimates", ico: "✎" },
   { id: "invoices", label: "Invoices", ico: "▤" },
   { id: "payments", label: "Payments", ico: "◎" },
@@ -226,6 +227,7 @@ function salesSeries(range) {
 const VIEWS = {};
 VIEWS.todo = viewTodo;
 VIEWS.marketing = () => viewMarketing();
+VIEWS.quote = () => viewQuote();
 const view = (html) => { $("#view").innerHTML = html; };
 
 VIEWS.home = () => {
@@ -571,6 +573,12 @@ async function openEstimate(leadId, existing = null) {
   let l = D.leads.find((x) => x.workiz_id === leadId) || {};
   const E = existing ? structuredClone(existing) : { lead_id: leadId || null, design_name: "", files: [], parts: [], extras: [], labor_hours: 0, labor_rate: num(PB.settings.labor_rate), markup_pct: num(PB.settings.markup_pct), status: "draft" };
   E.parts ||= []; E.extras ||= []; E.files ||= [];
+  // pricing fields (Tidy Squares margin/markup/multiplier method)
+  E.multiplier ??= 1 + num(E.markup_pct ?? PB.settings.markup_pct) / 100;
+  E.design_includes_parts ??= true;
+  E.labor_marked_up ??= false;
+  E.freight ??= 0; E.discount_pct ??= 0; E.deposit_pct ??= 50;
+  E.tax_pct ??= 7; E.tax_mode ??= "materials";
   const costOf = (pn) => PB.parts.find((p) => p.part_no === pn)?.unit_cost;
   E.parts.forEach((p) => { if (p.unit_cost == null && costOf(p.part_no) != null) p.unit_cost = num(costOf(p.part_no)); });
 
@@ -1226,4 +1234,311 @@ function mkLinks() {
       ["#ub-base", "#ub-src", "#ub-med", "#ub-camp"].forEach((s) => $(s).oninput = upd); upd();
       $("#ub-copy").onclick = async () => { try { await navigator.clipboard.writeText($("#ub-out").value); toast("Copied"); } catch { toast("Copy blocked", true); } };
     } };
+}
+
+// ---------- quick quote (closet pricing calculator) ----------
+// Prices come ONLY from files you import (price book + color multipliers). Nothing is estimated.
+const QQ = { tab: "quote", comps: null, colors: null, quotes: null, pending: null, q: null };
+const unitKind = (u) => {
+  const s = String(u || "").toLowerCase();
+  if (/sq\.?\s?f|sqft|\bsf\b|square/.test(s)) return "sqft";
+  if (/\blf\b|lin|\bft\b|foot|feet/.test(s)) return "ft";
+  if (/\bin\b|inch|"/.test(s)) return "in";
+  return "each";
+};
+const parseMoney = (v) => { if (typeof v === "number") return v; const s = String(v ?? "").replace(/[$,\s]/g, ""); if (s === "" || isNaN(Number(s))) return null; return Number(s); };
+function newQuote() { return { id: null, title: "", lead_id: null, color: "", lines: [], overhead_mode: "flat", overhead_value: 0, margin_pct: 40, tax_pct: 0, deposit_pct: 50, rounding: 0 }; }
+
+async function loadQQ(force = false) {
+  if (QQ.comps && !force) return;
+  const [a, b, c] = await Promise.all([
+    sb.from("calc_components").select("*").order("category").order("name").limit(10000),
+    sb.from("calc_colors").select("*").order("color"),
+    sb.from("calc_quotes").select("*").order("updated_at", { ascending: false }).limit(200),
+  ]);
+  const err = [a, b, c].find((r) => r.error); if (err) throw err.error;
+  QQ.comps = a.data; QQ.colors = b.data; QQ.quotes = c.data; QQ.q ||= newQuote();
+}
+
+function qqCalc(q) {
+  const mult = num(QQ.colors.find((c) => c.color === q.color)?.multiplier) || (q.color ? 0 : 1);
+  const lines = q.lines.map((l) => {
+    const k = unitKind(l.unit);
+    const factor = k === "sqft" ? (num(l.w) * num(l.h)) / 144 : k === "ft" ? num(l.len) / 12 : k === "in" ? num(l.len) : 1;
+    const m = l.color_applies ? mult : 1;
+    return { ...l, kind: k, factor, mult: m, cost: num(l.base_cost) * factor * num(l.qty) * m };
+  });
+  const linesCost = lines.reduce((s, l) => s + l.cost, 0);
+  const overhead = q.overhead_mode === "pct" ? linesCost * num(q.overhead_value) / 100 : num(q.overhead_value);
+  const jobCost = linesCost + overhead;
+  const m = Math.min(num(q.margin_pct), 99) / 100;
+  const rawPrice = jobCost / (1 - m);
+  const price = q.rounding ? Math.round(rawPrice / q.rounding) * q.rounding : rawPrice;
+  const profit = price - jobCost;
+  const tax = price * num(q.tax_pct) / 100;
+  const total = price + tax;
+  return { mult, lines, linesCost, overhead, jobCost, rawPrice, price, profit, profitPct: price ? (profit / price) * 100 : 0, tax, total, deposit: total * num(q.deposit_pct) / 100 };
+}
+
+async function viewQuote() {
+  view(`<div class="empty">Loading…</div>`);
+  try { await loadQQ(); } catch (e) { return view(`<div class="notice">${esc(e.message)}</div>`); }
+  const tabsHtml = [["quote", "Build a quote"], ["saved", `Saved quotes (${QQ.quotes.length})`], ["data", `Price data (${QQ.comps.length} parts · ${QQ.colors.length} colors)`]]
+    .map(([id, l]) => `<div class="tab ${QQ.tab === id ? "active" : ""}" data-qq="${id}" style="min-width:150px;text-align:left"><div class="t">${l}</div></div>`).join("");
+  const body = { quote: qqBuilder, saved: qqSaved, data: qqData }[QQ.tab]();
+  view(`<div class="page-head"><h2>Quick quote</h2><span class="muted">price a closet in seconds, no eCab needed</span></div><div class="tabs">${tabsHtml}</div>${body.html}`);
+  $$("[data-qq]").forEach((t) => t.onclick = () => { QQ.tab = t.dataset.qq; viewQuote(); });
+  body.mount?.();
+}
+
+function qqBuilder() {
+  const q = QQ.q;
+  if (!QQ.comps.length || !QQ.colors.length) {
+    return { html: `<div class="notice"><b>Import your price data first.</b> The calculator only uses numbers from your files, so it needs:<br>
+      ${QQ.comps.length ? "✓" : "①"} your <b>price-book export</b> (CSV or Excel): every component with its base cost<br>
+      ${QQ.colors.length ? "✓" : "②"} your <b>color multiplier table</b> (CSV or Excel): one row per color<br><br>
+      <button class="btn primary" id="go-data">Go to Price data →</button></div>`, mount() { $("#go-data").onclick = () => { QQ.tab = "data"; viewQuote(); }; } };
+  }
+  const c = qqCalc(q);
+  const cats = [...new Set(QQ.comps.map((x) => x.category || "Other"))];
+  const sizeCell = (l, i) => l.kind === "sqft" ? `<input type="number" min="0" step="0.25" data-qw="${i}" value="${l.w ?? ""}" placeholder="W in" style="width:70px" /> × <input type="number" min="0" step="0.25" data-qh="${i}" value="${l.h ?? ""}" placeholder="H in" style="width:70px" />`
+    : l.kind === "ft" || l.kind === "in" ? `<input type="number" min="0" step="0.25" data-ql="${i}" value="${l.len ?? ""}" placeholder="length in" style="width:90px" />` : `<span class="muted small">—</span>`;
+  return { html: `
+    <div class="grid" style="grid-template-columns:minmax(0,1fr) 340px;align-items:start">
+      <div>
+        <div class="card" style="margin-bottom:14px"><div class="card-b"><div class="form-row">
+          <label class="wide">Quote name / customer<input id="qq-title" value="${esc(q.title)}" placeholder="e.g. Smith master walk-in" /></label>
+          <label class="wide">Link to lead (optional)<input id="qq-lead" list="qq-leads" value="${(() => { const l = D.leads.find((x) => x.workiz_id === q.lead_id); return l ? esc(`${l.client_name} · ${l.uuid} #${l.workiz_id}`) : ""; })()}" /></label>
+          <datalist id="qq-leads">${D.leads.filter((x) => !x.lost).map((x) => `<option value="${esc(`${x.client_name} · ${x.uuid} #${x.workiz_id}`)}">`).join("")}</datalist></div>
+          <div class="form-row" style="margin-top:10px">
+            <label class="wide">Color for this job<select id="qq-color"><option value="">Pick a color…</option>${QQ.colors.map((x) => `<option value="${esc(x.color)}" ${x.color === q.color ? "selected" : ""}>${esc(x.color)} (×${num(x.multiplier)})</option>`).join("")}</select></label>
+          </div></div></div>
+
+        <div class="card"><div class="card-h"><h3>Components</h3><div class="spacer"></div><span class="muted small">line cost = base cost × size × qty × color multiplier</span></div>
+          <div class="table-wrap"><table><thead><tr><th>Component</th><th>Size</th><th class="right">Qty</th><th class="right">Base cost</th><th class="right">Color ×</th><th class="right">Line cost</th><th></th></tr></thead><tbody>
+          ${c.lines.map((l, i) => `<tr><td><b>${esc(l.name)}</b><span class="sub">${esc([l.sku, l.unit].filter(Boolean).join(" · "))}</span>
+              <label style="flex-direction:row;gap:6px;align-items:center;margin-top:4px;font-size:11px"><input type="checkbox" data-qca="${i}" ${l.color_applies ? "checked" : ""} style="width:auto" /> color applies</label></td>
+            <td>${sizeCell(l, i)}</td>
+            <td class="right"><input type="number" min="0" step="1" data-qq-qty="${i}" value="${l.qty}" style="width:64px;text-align:right" /></td>
+            <td class="right num">${money(l.base_cost)}${l.kind !== "each" ? `<span class="sub">per ${l.kind === "sqft" ? "sq ft" : l.kind}</span>` : ""}</td>
+            <td class="right num">${l.mult ? "×" + l.mult : '<span style="color:var(--red)">pick color</span>'}</td>
+            <td class="right num"><b>${money(l.cost)}</b></td><td class="right"><button class="btn small danger" data-qdel="${i}">✕</button></td></tr>`).join("") || `<tr><td colspan="7"><div class="empty">Add components below</div></td></tr>`}
+          </tbody></table></div>
+          <div class="card-b" style="border-top:1px solid var(--line)"><div class="form-row">
+            <label>Category<select id="qq-cat"><option value="">All</option>${cats.map((x) => `<option>${esc(x)}</option>`).join("")}</select></label>
+            <label class="wide">Component<input id="qq-comp" list="qq-comps" placeholder="Type to search your price book…" /></label>
+            <datalist id="qq-comps">${QQ.comps.map((x) => `<option value="${esc(`${x.name}${x.sku ? " · " + x.sku : ""} · ${money(x.base_cost)}${x.unit && unitKind(x.unit) !== "each" ? "/" + x.unit : ""} #${x.id}`)}">`).join("")}</datalist>
+            <button class="btn purple" id="qq-add">＋ Add</button></div></div></div>
+      </div>
+
+      <div class="card" style="position:sticky;top:76px"><div class="card-h"><h3>Price</h3></div><div class="card-b" style="display:flex;flex-direction:column;gap:12px">
+        <div class="kv" style="grid-template-columns:1fr auto"><div>Components</div><div class="num">${money(c.linesCost)}</div>
+          <div>Overhead</div><div class="num">${money(c.overhead)}</div>
+          <div><b>Job cost (yours)</b></div><div class="num"><b>${money(c.jobCost)}</b></div></div>
+        <div class="form-row" style="grid-template-columns:1fr 1fr"><label>Overhead<select id="qq-ohm"><option value="flat" ${q.overhead_mode === "flat" ? "selected" : ""}>Flat $</option><option value="pct" ${q.overhead_mode === "pct" ? "selected" : ""}>% of components</option></select></label>
+          <label>&nbsp;<input id="qq-ohv" type="number" min="0" step="1" value="${q.overhead_value}" /></label></div>
+        <label>Margin on sell price: <b id="qq-mlabel">${num(q.margin_pct)}%</b>
+          <input id="qq-margin" type="range" min="0" max="80" step="1" value="${num(q.margin_pct)}" style="accent-color:var(--orange);padding:0" />
+          <input id="qq-margin-n" type="number" min="0" max="95" step="0.5" value="${num(q.margin_pct)}" /></label>
+        <label>Round price<select id="qq-round"><option value="0" ${!q.rounding ? "selected" : ""}>No rounding</option><option value="5" ${q.rounding === 5 ? "selected" : ""}>Nearest $5</option><option value="10" ${q.rounding === 10 ? "selected" : ""}>Nearest $10</option></select></label>
+        <div class="profit-box" style="grid-template-columns:1fr 1fr">
+          <div><div class="l">Customer price</div><div class="v num" id="qq-price">${money(c.price)}</div></div>
+          <div><div class="l">Your profit</div><div class="v num ${c.profit >= 0 ? "pos" : "neg"}" id="qq-profit">${money(c.profit)}</div><div class="l" id="qq-ppct">${c.profitPct.toFixed(1)}% of price</div></div></div>
+        <div class="form-row" style="grid-template-columns:1fr 1fr"><label>Tax % (optional)<input id="qq-tax" type="number" min="0" step="0.1" value="${q.tax_pct}" /></label>
+          <label>Deposit %<input id="qq-dep" type="number" min="0" max="100" step="5" value="${q.deposit_pct}" /></label></div>
+        <div class="kv" style="grid-template-columns:1fr auto">${num(q.tax_pct) ? `<div>Tax</div><div class="num">${money(c.tax)}</div>` : ""}
+          <div><b>Total to customer</b></div><div class="num"><b>${money(c.total)}</b></div>
+          <div>Deposit (${num(q.deposit_pct)}%)</div><div class="num">${money(c.deposit)}</div></div>
+        ${!q.color ? `<div class="warn">Pick a color: color-priced lines show $0 until you do.</div>` : ""}
+        <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn primary" id="qq-save">${q.id ? "Save changes" : "Save quote"}</button>
+          <button class="btn" id="qq-pdf">Customer PDF</button><button class="btn" id="qq-csv">CSV</button><button class="btn ghost" id="qq-new">New</button></div>
+      </div></div>
+    </div>`,
+    mount() {
+      const re = () => viewQuote();
+      $("#qq-title").onchange = (e) => (q.title = e.target.value);
+      $("#qq-lead").onchange = (e) => { const m = e.target.value.match(/#(LD-[\w-]+)$/); q.lead_id = m ? m[1] : null; if (m && !q.title) { const l = D.leads.find((x) => x.workiz_id === m[1]); q.title = l?.client_name || ""; } re(); };
+      $("#qq-color").onchange = (e) => { q.color = e.target.value; re(); };
+      $("#qq-cat").onchange = (e) => { const cat = e.target.value; $("#qq-comps").innerHTML = QQ.comps.filter((x) => !cat || (x.category || "Other") === cat).map((x) => `<option value="${esc(`${x.name}${x.sku ? " · " + x.sku : ""} · ${money(x.base_cost)} #${x.id}`)}">`).join(""); };
+      $("#qq-add").onclick = () => {
+        const m = $("#qq-comp").value.match(/#(\d+)$/); const x = m && QQ.comps.find((c) => String(c.id) === m[1]);
+        if (!x) return toast("Pick a component from the list", true);
+        q.lines.push({ comp_id: x.id, name: x.name, sku: x.sku, unit: x.unit, base_cost: num(x.base_cost), qty: 1, color_applies: x.color_applies !== false }); re();
+      };
+      const bind = (sel, key, cast = num) => $$(`[${sel}]`).forEach((inp) => inp.onchange = () => { q.lines[inp.getAttribute(sel)][key] = cast(inp.value); re(); });
+      bind("data-qq-qty", "qty"); bind("data-qw", "w"); bind("data-qh", "h"); bind("data-ql", "len");
+      $$("[data-qca]").forEach((cb) => cb.onchange = () => { q.lines[cb.dataset.qca].color_applies = cb.checked; re(); });
+      $$("[data-qdel]").forEach((b) => b.onclick = () => { q.lines.splice(Number(b.dataset.qdel), 1); re(); });
+      $("#qq-ohm").onchange = (e) => { q.overhead_mode = e.target.value; re(); };
+      $("#qq-ohv").onchange = (e) => { q.overhead_value = num(e.target.value); re(); };
+      const liveMargin = (v) => {   // live update without re-rendering the page
+        q.margin_pct = Math.min(num(v), 95); const k = qqCalc(q);
+        $("#qq-mlabel").textContent = `${q.margin_pct}%`; $("#qq-margin").value = q.margin_pct; $("#qq-margin-n").value = q.margin_pct;
+        $("#qq-price").textContent = money(k.price); $("#qq-profit").textContent = money(k.profit); $("#qq-ppct").textContent = `${k.profitPct.toFixed(1)}% of price`;
+      };
+      $("#qq-margin").oninput = (e) => liveMargin(e.target.value);
+      $("#qq-margin").onchange = () => re();
+      $("#qq-margin-n").onchange = (e) => { liveMargin(e.target.value); re(); };
+      $("#qq-round").onchange = (e) => { q.rounding = Number(e.target.value); re(); };
+      $("#qq-tax").onchange = (e) => { q.tax_pct = num(e.target.value); re(); };
+      $("#qq-dep").onchange = (e) => { q.deposit_pct = num(e.target.value); re(); };
+      $("#qq-new").onclick = () => { QQ.q = newQuote(); re(); };
+      $("#qq-save").onclick = async () => {
+        const k = qqCalc(q);
+        const row = { title: q.title || "Untitled quote", lead_id: q.lead_id, color: q.color, lines: q.lines, overhead_mode: q.overhead_mode, overhead_value: q.overhead_value, margin_pct: q.margin_pct, tax_pct: q.tax_pct, deposit_pct: q.deposit_pct, rounding: q.rounding,
+          totals: { job_cost: k.jobCost, price: k.price, profit: k.profit, total: k.total, multiplier: k.mult }, updated_at: new Date().toISOString() };
+        const res = q.id ? await sb.from("calc_quotes").update(row).eq("id", q.id).select().single() : await sb.from("calc_quotes").insert(row).select().single();
+        if (res.error) return toast(res.error.message, true);
+        q.id = res.data.id; await loadQQ(true); toast("Quote saved"); re();
+      };
+      $("#qq-csv").onclick = () => qqCsv(q);
+      $("#qq-pdf").onclick = () => qqPdf(q);
+    } };
+}
+
+function qqCsv(q) {
+  const k = qqCalc(q); const cell = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const rows = [["Component", "SKU", "Unit", "Size", "Qty", "Base cost", "Color multiplier", "Line cost"],
+    ...k.lines.map((l) => [l.name, l.sku, l.unit, l.kind === "sqft" ? `${l.w || 0}x${l.h || 0} in` : l.kind === "each" ? "" : `${l.len || 0} in`, l.qty, l.base_cost.toFixed(2), l.mult, l.cost.toFixed(2)]),
+    [], ["Components", "", "", "", "", "", "", k.linesCost.toFixed(2)], ["Overhead", "", "", "", "", "", "", k.overhead.toFixed(2)], ["Job cost", "", "", "", "", "", "", k.jobCost.toFixed(2)],
+    ["Margin %", "", "", "", "", "", "", q.margin_pct], ["Customer price", "", "", "", "", "", "", k.price.toFixed(2)], ["Profit", "", "", "", "", "", "", k.profit.toFixed(2)],
+    ["Tax", "", "", "", "", "", "", k.tax.toFixed(2)], ["Total", "", "", "", "", "", "", k.total.toFixed(2)], ["Deposit", "", "", "", "", "", "", k.deposit.toFixed(2)]];
+  const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([rows.map((r) => r.map(cell).join(",")).join("\n")], { type: "text/csv" }));
+  a.download = `quote-${(q.title || "closet").replace(/\W+/g, "-")}.csv`; a.click();
+}
+
+function qqPdf(q) {
+  const k = qqCalc(q); const l = D.leads.find((x) => x.workiz_id === q.lead_id) || {};
+  const w = window.open("", "_blank");
+  w.document.write(`<!doctype html><html><head><title>Quote · ${esc(q.title || l.client_name || "")}</title><style>
+    body{font:14px/1.5 Poppins,Arial,sans-serif;color:#111;max-width:780px;margin:30px auto;padding:0 20px} h1{font-size:22px;margin:8px 0 0}
+    .muted{color:#666} table{width:100%;border-collapse:collapse;margin:14px 0} td,th{padding:8px;border-bottom:1px solid #ddd;text-align:left} .r{text-align:right}
+    .tot td{font-weight:700;font-size:16px;border-top:2px solid #111}</style></head><body>
+    <img src="${location.origin}/assets/logo-dark.png" style="width:200px;background:#111;padding:10px;border-radius:8px" />
+    <h1>Quote</h1><div class="muted">${new Date().toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })}</div>
+    <p><b>${esc(q.title || l.client_name || "")}</b>${l.address ? "<br>" + esc(l.address) : ""}${l.client_phone ? "<br>" + esc(phone(l.client_phone)) : ""}</p>
+    <p>Custom closet system in <b>${esc(q.color || "")}</b>, designed, supplied and installed.</p>
+    <table><tr><th>Includes</th><th class="r">Qty</th></tr>
+      ${k.lines.map((x) => `<tr><td>${esc(x.name)}${x.kind === "sqft" ? ` (${x.w}" × ${x.h}")` : x.kind !== "each" ? ` (${x.len}")` : ""}</td><td class="r">${num(x.qty)}</td></tr>`).join("")}</table>
+    <table><tr><td>Price</td><td class="r">${money(k.price)}</td></tr>${num(q.tax_pct) ? `<tr><td>Tax (${num(q.tax_pct)}%)</td><td class="r">${money(k.tax)}</td></tr>` : ""}
+      <tr class="tot"><td>Total</td><td class="r">${money(k.total)}</td></tr><tr><td>Deposit to schedule (${num(q.deposit_pct)}%)</td><td class="r">${money(k.deposit)}</td></tr></table>
+    <p class="muted">Up Closets of Rhode Island · (401) 407-6495 · rhodeisland@upclosets.com</p><script>setTimeout(()=>print(),400)<\/script></body></html>`);
+  w.document.close();
+}
+
+function qqSaved() {
+  return { html: `<div class="card"><div class="table-wrap"><table><thead><tr><th>Quote</th><th>Color</th><th class="right">Lines</th><th class="right">Job cost</th><th class="right">Price</th><th class="right">Profit</th><th>Updated</th><th></th></tr></thead><tbody>
+    ${QQ.quotes.map((x) => `<tr class="click" data-qopen="${x.id}"><td><b>${esc(x.title)}</b></td><td>${esc(x.color || "")}</td><td class="right">${(x.lines || []).length}</td>
+      <td class="right num">${money(x.totals?.job_cost)}</td><td class="right num">${money(x.totals?.price)}</td><td class="right num">${money(x.totals?.profit)}</td><td>${esc(fmtDate(x.updated_at))}</td>
+      <td class="right"><button class="btn small" data-qdup="${x.id}">Duplicate</button></td></tr>`).join("") || `<tr><td colspan="8"><div class="empty">No saved quotes yet</div></td></tr>`}
+    </tbody></table></div></div>`,
+    mount() {
+      $$("[data-qopen]").forEach((tr) => tr.onclick = (e) => { if (e.target.dataset.qdup) return; const x = QQ.quotes.find((y) => String(y.id) === tr.dataset.qopen); QQ.q = { ...newQuote(), ...structuredClone(x) }; QQ.tab = "quote"; viewQuote(); });
+      $$("[data-qdup]").forEach((b) => b.onclick = () => { const x = QQ.quotes.find((y) => String(y.id) === b.dataset.qdup); QQ.q = { ...newQuote(), ...structuredClone(x), id: null, title: x.title + " (copy)" }; QQ.tab = "quote"; viewQuote(); });
+    } };
+}
+
+// ---- price data import ----
+function parseCsv(text) {
+  const rows = []; let row = [], cur = "", q = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (q) { if (ch === '"' && text[i + 1] === '"') { cur += '"'; i++; } else if (ch === '"') q = false; else cur += ch; }
+    else if (ch === '"') q = true; else if (ch === ",") { row.push(cur); cur = ""; } else if (ch === "\n" || ch === "\r") { if (ch === "\r" && text[i + 1] === "\n") i++; row.push(cur); rows.push(row); row = []; cur = ""; } else cur += ch;
+  }
+  if (cur !== "" || row.length) { row.push(cur); rows.push(row); }
+  return rows.filter((r) => r.some((c) => String(c).trim() !== ""));
+}
+async function readTable(file) {
+  if (/\.csv$|\.txt$/i.test(file.name)) return parseCsv(await file.text());
+  const XLSX = await import("https://cdn.jsdelivr.net/npm/xlsx@0.18.5/+esm");
+  const wb = XLSX.read(await file.arrayBuffer(), { type: "array" });
+  // pick the sheet with the most rows
+  const sheets = wb.SheetNames.map((n) => XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: true, defval: "" }));
+  return sheets.sort((a, b) => b.length - a.length)[0].filter((r) => r.some((c) => String(c).trim() !== ""));
+}
+const guessCol = (hdr, re) => hdr.findIndex((h) => re.test(String(h)));
+
+function qqData() {
+  const P = QQ.pending;
+  const mapUI = () => {
+    if (!P) return "";
+    const opts = (sel) => `<option value="-1">— none —</option>` + P.header.map((h, i) => `<option value="${i}" ${sel === i ? "selected" : ""}>${esc(h || `Column ${i + 1}`)}</option>`).join("");
+    const fields = P.kind === "comps"
+      ? [["name", "Component name *"], ["cost", "Base cost *"], ["sku", "SKU / part #"], ["unit", "Unit (each, ft, in, sq ft)"], ["category", "Category"]]
+      : [["color", "Color *"], ["mult", "Multiplier *"]];
+    const prev = qqBuildRows(P).slice(0, 8);
+    return `<div class="card" style="margin-top:16px;border-color:var(--purple)"><div class="card-h"><h3>Check the columns: ${esc(P.file)}</h3><div class="spacer"></div><span class="muted small">${P.rows.length} rows found</span></div><div class="card-b">
+      <div class="form-row">${fields.map(([k, l]) => `<label>${l}<select data-map="${k}">${opts(P.map[k])}</select></label>`).join("")}
+      ${P.kind === "colors" ? `<label>Values are<select id="mult-mode"><option value="mult" ${P.multMode === "mult" ? "selected" : ""}>Multipliers (1.10)</option><option value="pct" ${P.multMode === "pct" ? "selected" : ""}>% added (10 = +10%)</option></select></label>` : ""}</div>
+      <div class="table-wrap" style="margin-top:12px"><table><thead><tr>${P.kind === "comps" ? "<th>Name</th><th>SKU</th><th>Unit</th><th>Category</th><th class='right'>Base cost</th>" : "<th>Color</th><th class='right'>Multiplier used</th>"}</tr></thead><tbody>
+      ${prev.map((r) => P.kind === "comps" ? `<tr><td>${esc(r.name)}</td><td>${esc(r.sku || "")}</td><td>${esc(r.unit || "each")}</td><td>${esc(r.category || "")}</td><td class="right num">${money(r.base_cost)}</td></tr>` : `<tr><td>${esc(r.color)}</td><td class="right num">×${r.multiplier}</td></tr>`).join("")}</tbody></table></div>
+      <p class="muted small">${qqBuildRows(P).length} usable rows · ${P.rows.length - qqBuildRows(P).length} skipped (no name or no number). Numbers are used exactly as they are in your file.</p>
+      <div style="display:flex;gap:8px"><button class="btn primary" id="imp-replace">Replace ${P.kind === "comps" ? "price book" : "color table"} with this file</button>${P.kind === "comps" ? `<button class="btn" id="imp-add">Add to existing</button>` : ""}<button class="btn ghost" id="imp-cancel">Cancel</button></div></div></div>`;
+  };
+  const t = table("qq-comps", { rows: QQ.comps, search: (x) => [x.name, x.sku, x.category].join(" "),
+    cols: [{ label: "Component", key: "name", render: (x) => `${esc(x.name)}<span class="sub">${esc(x.sku || "")}</span>` }, { label: "Category", key: "category" }, { label: "Unit", key: "unit" },
+      { label: "Base cost", key: "base_cost", right: true, render: (x) => money(x.base_cost) },
+      { label: "Color applies", key: "color_applies", render: (x) => `<input type="checkbox" data-capp="${x.id}" ${x.color_applies !== false ? "checked" : ""} style="width:auto" />` },
+      { label: "Source", key: "source", render: (x) => `<span class="muted small">${esc(x.source || "")}</span>` }] });
+  return { html: `
+    <div class="grid g2">
+      <div class="card"><div class="card-h"><h3>① Price book</h3><div class="spacer"></div><span class="muted small">${QQ.comps.length} components</span></div><div class="card-b">
+        <label class="dropzone" for="f-comps">⇪ Upload your price-book export (CSV or Excel)</label><input id="f-comps" type="file" accept=".csv,.txt,.xlsx,.xls" class="hidden" />
+        <p class="muted small">Needs a name column and a base cost column. Optional: SKU, unit (each / ft / in / sq ft, which controls the size boxes), category.</p>
+        <button class="btn small" id="load-parts">Or load the Tidy Squares prices you've already entered (Part costs)</button></div></div>
+      <div class="card"><div class="card-h"><h3>② Color multipliers</h3><div class="spacer"></div><span class="muted small">${QQ.colors.length} colors</span></div><div class="card-b">
+        <label class="dropzone" for="f-colors">⇪ Upload your color multiplier table (CSV or Excel)</label><input id="f-colors" type="file" accept=".csv,.txt,.xlsx,.xls" class="hidden" />
+        ${QQ.colors.length ? `<div class="kv" style="grid-template-columns:1fr auto;margin-top:10px">${QQ.colors.map((c) => `<div>${esc(c.color)}</div><div class="num">×${num(c.multiplier)}</div>`).join("")}</div>` : `<p class="muted small">Needs a color column and a multiplier column (1.10, or a % added).</p>`}</div></div>
+    </div>
+    ${mapUI()}
+    <h3 style="margin:20px 0 10px">Price book components</h3>${t.html}`,
+    mount() {
+      t.mount();
+      const pick = (kind) => async (e) => {
+        const f = e.target.files[0]; if (!f) return;
+        try {
+          const all = await readTable(f); const header = all[0].map((h) => String(h).trim()); const rows = all.slice(1);
+          const map = kind === "comps"
+            ? { name: guessCol(header, /name|desc|component|item(?!.*(no|#|num))/i), cost: guessCol(header, /cost|price|base/i), sku: guessCol(header, /sku|part|code|item ?(no|#|num)/i), unit: guessCol(header, /unit|uom|per/i), category: guessCol(header, /cat|type|group/i) }
+            : { color: guessCol(header, /colou?r|finish|name/i), mult: guessCol(header, /mult|factor|adj|%|percent|upcharge/i) };
+          if (kind === "colors" && map.mult < 0) map.mult = header.findIndex((_, i) => i !== map.color);
+          const sample = kind === "colors" ? rows.map((r) => parseMoney(String(r[map.mult] ?? "").replace("%", ""))).filter((v) => v != null) : [];
+          QQ.pending = { kind, file: f.name, header, rows, map, multMode: sample.some((v) => v >= 3) || rows.some((r) => /%/.test(String(r[map.mult]))) ? "pct" : "mult" };
+          viewQuote();
+        } catch (err) { toast(`Couldn't read ${f.name}: ${err.message}`, true); }
+      };
+      $("#f-comps").onchange = pick("comps"); $("#f-colors").onchange = pick("colors");
+      $$("[data-map]").forEach((s) => s.onchange = () => { QQ.pending.map[s.dataset.map] = Number(s.value); viewQuote(); });
+      const mm = $("#mult-mode"); if (mm) mm.onchange = () => { QQ.pending.multMode = mm.value; viewQuote(); };
+      const cancel = $("#imp-cancel"); if (cancel) cancel.onclick = () => { QQ.pending = null; viewQuote(); };
+      const doImport = (replace) => async () => {
+        const P = QQ.pending; const rows = qqBuildRows(P); if (!rows.length) return toast("No usable rows", true);
+        const tbl = P.kind === "comps" ? "calc_components" : "calc_colors";
+        if (replace) { const d = P.kind === "comps" ? await sb.from(tbl).delete().gte("id", 0) : await sb.from(tbl).delete().neq("color", ""); if (d.error) return toast(d.error.message, true); }
+        for (let i = 0; i < rows.length; i += 500) {
+          const chunk = rows.slice(i, i + 500).map((r) => ({ ...r, source: P.file }));
+          const res = P.kind === "comps" ? await sb.from(tbl).insert(chunk) : await sb.from(tbl).upsert(chunk, { onConflict: "color" });
+          if (res.error) return toast(res.error.message, true);
+        }
+        QQ.pending = null; await loadQQ(true); toast(`Imported ${rows.length} rows`); viewQuote();
+      };
+      const r1 = $("#imp-replace"); if (r1) r1.onclick = doImport(true);
+      const r2 = $("#imp-add"); if (r2) r2.onclick = doImport(false);
+      $("#load-parts").onclick = async () => {
+        const { data, error } = await sb.from("part_prices").select("*").not("unit_cost", "is", null);
+        if (error) return toast(error.message, true);
+        const have = new Set(QQ.comps.map((c) => c.sku).filter(Boolean));
+        const rows = data.filter((p) => !have.has(p.part_no)).map((p) => ({ sku: p.part_no, name: p.description || p.part_no, category: p.supplier || "Other", unit: "each", base_cost: num(p.unit_cost), color_applies: false, source: p.source || "Part costs" }));
+        if (!rows.length) return toast("Nothing new to load");
+        const res = await sb.from("calc_components").insert(rows); if (res.error) return toast(res.error.message, true);
+        await loadQQ(true); toast(`Loaded ${rows.length} parts (color multiplier off for hardware; turn it on per part if needed)`); viewQuote();
+      };
+      $$("[data-capp]").forEach((cb) => cb.onchange = async () => { const { error } = await sb.from("calc_components").update({ color_applies: cb.checked }).eq("id", cb.dataset.capp); if (error) return toast(error.message, true); const x = QQ.comps.find((c) => String(c.id) === cb.dataset.capp); if (x) x.color_applies = cb.checked; });
+    } };
+}
+function qqBuildRows(P) {
+  const g = (r, k) => (P.map[k] >= 0 ? r[P.map[k]] : "");
+  if (P.kind === "comps") return P.rows.map((r) => ({ name: String(g(r, "name") ?? "").trim(), base_cost: parseMoney(g(r, "cost")), sku: String(g(r, "sku") ?? "").trim() || null, unit: String(g(r, "unit") ?? "").trim() || "each", category: String(g(r, "category") ?? "").trim() || null })).filter((r) => r.name && r.base_cost != null);
+  return P.rows.map((r) => { const raw = parseMoney(String(g(r, "mult") ?? "").replace("%", "")); return { color: String(g(r, "color") ?? "").trim(), multiplier: raw == null ? null : P.multMode === "pct" ? +(1 + raw / 100).toFixed(6) : raw }; }).filter((r) => r.color && r.multiplier != null);
 }
